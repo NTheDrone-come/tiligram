@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" fill="none">
+  <defs>
+    <linearGradient id="tgBg" x1="0" y1="0" x2="512" y2="512" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#37AEE2" />
+      <stop offset="100%" stop-color="#1E6BB8" />
+    </linearGradient>
+    <linearGradient id="planeShadow" x1="180" y1="220" x2="290" y2="380" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#C8E4F8" />
+      <stop offset="100%" stop-color="#A3D2F5" />
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" rx="112" fill="url(#tgBg)" />
+  <path
+    d="M392.4 139.2L340.6 382.8c-3.9 17.2-14.1 21.5-28.5 13.4l-78.8-58.1-38 36.6c-4.2 4.2-7.8 7.8-15.9 7.8l5.7-80.3 146.1-132c6.4-5.7-1.4-8.8-9.8-3.2L140.8 281.4l-77.8-24.3c-16.9-5.3-17.2-16.9 3.5-25l304.1-117.2c14.1-5.1 26.4 3.4 21.8 24.3z"
+    fill="#FFFFFF"
+  />
+  <path
+    d="M210.7 302.2l-5.7 80.3c8.1 0 11.7-3.6 15.9-7.8l38-36.6-48.2-35.9z"
+    fill="url(#planeShadow)"
+  />
+</svg>

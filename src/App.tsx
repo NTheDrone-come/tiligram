@@ -15,6 +15,7 @@ import {
   NotificationPopups,
   type TelegramPopupNotification,
 } from './components/NotificationPopups';
+import { OfflineIndicator } from './components/PWAInstallButton';
 import { SettingsModal, type SettingsTabId } from './components/SettingsModal';
 import { StickerStudioModal } from './components/StickerStudioModal';
 import { DEFAULT_APP_SETTINGS } from './data/seedData';
@@ -27,6 +28,7 @@ import type {
   AppSettings,
   CallSignalPayload,
   ChatFolder,
+  ChatMember,
   ChatMessage,
   ChatThread,
   ChatType,
@@ -330,6 +332,10 @@ export default function App() {
       root.classList.remove('dark');
     }
     root.style.setProperty('--tg-accent', accent || '#3390EC');
+    const metaTheme = document.querySelector('meta[name="theme-color"]');
+    if (metaTheme) {
+      metaTheme.setAttribute('content', theme === 'dark' ? '#17212B' : '#FFFFFF');
+    }
   }, [authToken, tg.settings.theme, tg.settings.accentColor]);
 
   // Select Saved Messages (or first available chat) once chats arrive
@@ -340,6 +346,42 @@ export default function App() {
       setActiveChatId(saved?.id ?? tg.chats[0].id);
     }
   }, [authToken, tg.chats, activeChatId]);
+
+  // Automatically send real-time read receipts when viewing an open chat with unread messages
+  const activeChatMsgs = activeChatId ? tg.messagesByChat[activeChatId] : undefined;
+  const activeChatHasUnread = Boolean(
+    activeChatId &&
+      tg.currentUser &&
+      ((tg.chats.find((c) => c.id === activeChatId)?.unreadCount ?? 0) > 0 ||
+        (activeChatMsgs ?? []).some(
+          (m) =>
+            m.senderId !== tg.currentUser!.id &&
+            m.status !== 'read' &&
+            !(m.readBy?.includes(tg.currentUser!.id)),
+        )),
+  );
+
+  useEffect(() => {
+    if (!activeChatId || !activeChatHasUnread) return;
+    if (!document.hidden) {
+      tg.markChatRead(activeChatId);
+    }
+  }, [activeChatId, activeChatHasUnread, tg.markChatRead]);
+
+  useEffect(() => {
+    if (!activeChatId) return;
+    const handleReadOnReturn = () => {
+      if (!document.hidden && activeChatHasUnread) {
+        tg.markChatRead(activeChatId);
+      }
+    };
+    window.addEventListener('focus', handleReadOnReturn);
+    document.addEventListener('visibilitychange', handleReadOnReturn);
+    return () => {
+      window.removeEventListener('focus', handleReadOnReturn);
+      document.removeEventListener('visibilitychange', handleReadOnReturn);
+    };
+  }, [activeChatId, activeChatHasUnread, tg.markChatRead]);
 
   // Close overlays on Escape key
   useEffect(() => {
@@ -367,7 +409,7 @@ export default function App() {
 
   if (checkingAuth) {
     return (
-      <div className="min-h-screen w-screen bg-[#0E1621] text-slate-100 flex flex-col items-center justify-center gap-4">
+      <div className="min-h-[100dvh] h-[100dvh] w-full bg-[#0E1621] text-slate-100 flex flex-col items-center justify-center gap-4">
         <div className="w-14 h-14 rounded-2xl bg-[#3390EC] text-white flex items-center justify-center shadow-lg">
           <Send className="w-7 h-7" />
         </div>
@@ -491,8 +533,34 @@ export default function App() {
     (updater.updateInfo.status === 'available' ||
       updater.updateInfo.status === 'downloaded');
 
+  const handleOpenDirectChatWithMember = (member: ChatMember) => {
+    const existing = tg.chats.find(
+      (c) =>
+        c.type === 'private' &&
+        (c.peerUserId === member.id || c.participantIds?.includes(member.id)),
+    );
+    if (existing) {
+      handleSelectChat(existing.id);
+      setShowInfoPanel(false);
+      return;
+    }
+    const newId = tg.createChat({
+      type: 'private',
+      title: member.name,
+      username: member.username,
+      bio: member.bio,
+      avatarColor: member.avatarColor || '#3390EC',
+      targetUserId: member.id,
+    });
+    setShowArchived(false);
+    setFolder('all');
+    setActiveChatId(newId);
+    setMobileShowChat(true);
+    setShowInfoPanel(false);
+  };
+
   return (
-    <div className="h-screen w-screen overflow-hidden flex flex-col bg-white dark:bg-[#0E1621] text-slate-900 dark:text-slate-100">
+    <div className="h-[100dvh] w-full overflow-hidden flex flex-col bg-white dark:bg-[#0E1621] text-slate-900 dark:text-slate-100">
       {/* Real GitHub Release Auto-Update Banner (only shown when a newer release exists) */}
       {showUpdateBanner && (
         <div className="px-4 py-2 bg-[#3390EC] text-white text-xs sm:text-[13px] flex items-center justify-between gap-3 shrink-0 z-30">
@@ -542,6 +610,7 @@ export default function App() {
           <ChatSidebar
             chats={tg.chats}
             messagesByChat={tg.messagesByChat}
+            typingByChat={tg.typingByChat}
             currentUserId={tg.currentUser.id}
             activeChatId={activeChatId}
             folder={folder}
@@ -597,11 +666,19 @@ export default function App() {
           {showInfoPanel && activeChat && (
             <ChatInfoPanel
               chat={activeChat}
+              allChats={tg.chats}
               messages={activeMessages}
+              currentUser={tg.currentUser}
               onClose={() => setShowInfoPanel(false)}
               onToggleMute={(id, muted) => tg.updateChatFlags(id, { muted })}
               onOpenLightbox={(url, caption) => setLightbox({ url, caption })}
               onJumpToMessage={(messageId) => setHighlightMessageId(messageId)}
+              onStartCall={(chatId, mode) =>
+                void callController.initiateCall(chatId, mode)
+              }
+              onSelectChat={(chatId) => handleSelectChat(chatId)}
+              onOpenDirectChatWithMember={handleOpenDirectChatWithMember}
+              onOpenEditProfile={() => openSettingsTab('profile')}
             />
           )}
         </div>
@@ -642,6 +719,7 @@ export default function App() {
       <CreateChatModal
         open={createModal.open}
         defaultType={createModal.type}
+        directoryVersion={tg.directoryVersion}
         onClose={() => setCreateModal((prev) => ({ ...prev, open: false }))}
         onSearchUsers={tg.searchUsers}
         onCreate={(params) => {
@@ -715,6 +793,9 @@ export default function App() {
 
       {/* Real WebRTC P2P & Group Call Overlay */}
       <CallOverlay call={callController} currentUserId={tg.currentUser.id} />
+
+      {/* Mobile / PWA Offline Connectivity Banner */}
+      <OfflineIndicator />
     </div>
   );
 }

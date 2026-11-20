@@ -35,6 +35,7 @@ import { EMOJI_GROUPS } from '../data/seedData';
 import {
   formatDateDivider,
   formatDuration,
+  formatLastSeen,
   searchMessagesInChat,
 } from '../utils/chatLogic';
 import { formatRemainingRetention } from '../utils/fileRetention';
@@ -149,9 +150,10 @@ export function ChatWindow({
   const [isRecording, setIsRecording] = useState(false);
   const [recordSeconds, setRecordSeconds] = useState(0);
 
-  // Scroll state
+  // Scroll & live presence tick state
   const [showScrollBottom, setShowScrollBottom] = useState(false);
   const [localHighlightId, setLocalHighlightId] = useState<string | null>(null);
+  const [presenceTick, setPresenceTick] = useState(0);
 
   const feedRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
@@ -159,6 +161,12 @@ export function ChatWindow({
   const pickerRef = useRef<HTMLDivElement>(null);
   const headerMenuRef = useRef<HTMLDivElement>(null);
   const typingTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const lastTypingSentAtRef = useRef<number>(0);
+
+  useEffect(() => {
+    const interval = setInterval(() => setPresenceTick((t) => t + 1), 30_000);
+    return () => clearInterval(interval);
+  }, []);
 
   useEffect(() => {
     if (
@@ -191,7 +199,19 @@ export function ChatWindow({
     setIsRecording(false);
     setRecordSeconds(0);
     setDraft('');
-  }, [chat?.id]);
+    lastTypingSentAtRef.current = 0;
+    const prevChatId = chat?.id;
+    return () => {
+      if (typingTimeoutRef.current) {
+        clearTimeout(typingTimeoutRef.current);
+        typingTimeoutRef.current = null;
+      }
+      if (prevChatId && lastTypingSentAtRef.current > 0) {
+        onTyping(prevChatId, false);
+        lastTypingSentAtRef.current = 0;
+      }
+    };
+  }, [chat?.id, onTyping]);
 
   useEffect(() => {
     if (!feedRef.current || highlightMessageId) return;
@@ -270,11 +290,25 @@ export function ChatWindow({
 
   const handleInputChange = (value: string) => {
     setDraft(value);
-    onTyping(chat.id, value.trim().length > 0);
+    const hasText = value.trim().length > 0;
+    if (!hasText) {
+      if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current);
+      if (lastTypingSentAtRef.current > 0) {
+        onTyping(chat.id, false);
+        lastTypingSentAtRef.current = 0;
+      }
+      return;
+    }
+    const now = Date.now();
+    if (now - lastTypingSentAtRef.current >= 1800) {
+      onTyping(chat.id, true);
+      lastTypingSentAtRef.current = now;
+    }
     if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current);
     typingTimeoutRef.current = setTimeout(() => {
       onTyping(chat.id, false);
-    }, 2500);
+      lastTypingSentAtRef.current = 0;
+    }, 3000);
   };
 
   const handleSubmit = () => {
@@ -393,8 +427,11 @@ export function ChatWindow({
   };
 
   const subtitle = (() => {
+    void presenceTick;
     if (typingState) {
-      return `${typingState.userName.split(' ')[0]} печатает...`;
+      return chat.type === 'group'
+        ? `${typingState.userName.split(' ')[0]} печатает...`
+        : 'печатает...';
     }
     if (chat.type === 'saved') return 'Личные заметки и сохранённые файлы';
     if (chat.type === 'channel') {
@@ -404,7 +441,9 @@ export function ChatWindow({
       const onlineMembers = chat.members?.filter((m) => m.online).length ?? 1;
       return `${chat.memberCount ?? chat.members?.length ?? 1} участников, ${onlineMembers} в сети`;
     }
-    return chat.online ? 'в сети' : chat.lastSeenText || 'был(а) недавно';
+    if (chat.online) return 'в сети';
+    if (chat.lastSeenAt) return formatLastSeen(chat.lastSeenAt, false);
+    return chat.lastSeenText || 'был(а) недавно';
   })();
 
   const pendingRetentionText = pendingAttachment?.attachment.expiresAt
@@ -419,13 +458,13 @@ export function ChatWindow({
       className="relative flex-1 flex flex-col h-full min-w-0 bg-white dark:bg-[#0E1621]"
     >
       {/* Chat Header */}
-      <header className="h-[58px] px-3 sm:px-4 bg-white dark:bg-[#17212B] border-b border-slate-200/90 dark:border-[#0E1621] flex items-center justify-between gap-3 shrink-0 z-20">
-        <div className="flex items-center gap-2.5 min-w-0 flex-1">
+      <header className="min-h-[58px] pt-safe px-2.5 sm:px-4 bg-white dark:bg-[#17212B] border-b border-slate-200/90 dark:border-[#0E1621] flex items-center justify-between gap-2 sm:gap-3 shrink-0 z-20">
+        <div className="flex items-center gap-1.5 sm:gap-2.5 min-w-0 flex-1">
           <button
             type="button"
             onClick={onBackMobile}
             aria-label="Назад к списку чатов"
-            className="md:hidden min-w-[40px] min-h-[40px] -ml-1 rounded-full flex items-center justify-center text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-[#232E3C] cursor-pointer"
+            className="md:hidden min-w-[44px] min-h-[44px] -ml-1 rounded-full flex items-center justify-center text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-[#232E3C] cursor-pointer shrink-0"
           >
             <ArrowLeft className="w-5 h-5" />
           </button>
@@ -434,7 +473,7 @@ export function ChatWindow({
             type="button"
             onClick={onToggleInfoPanel}
             aria-label={`Открыть профиль: ${chat.title}`}
-            className="flex items-center gap-3 min-w-0 text-left hover:opacity-90 transition-opacity cursor-pointer"
+            className="flex items-center gap-2.5 sm:gap-3 min-w-0 min-h-[44px] text-left hover:opacity-90 transition-opacity cursor-pointer"
           >
             <Avatar
               title={chat.title}
@@ -454,7 +493,7 @@ export function ChatWindow({
                 )}
               </div>
               <p
-                className={`text-[12.5px] truncate ${
+                className={`text-[12.5px] truncate flex items-center gap-1 ${
                   typingState || (chat.type === 'private' && chat.online)
                     ? 'font-medium'
                     : 'text-slate-500 dark:text-slate-400'
@@ -465,14 +504,21 @@ export function ChatWindow({
                     : undefined
                 }
               >
-                {subtitle}
+                {typingState && (
+                  <span className="inline-flex items-center gap-0.5 mr-0.5 shrink-0">
+                    <span className="w-1 h-1 rounded-full bg-current animate-bounce [animation-delay:-0.25s]" />
+                    <span className="w-1 h-1 rounded-full bg-current animate-bounce [animation-delay:-0.12s]" />
+                    <span className="w-1 h-1 rounded-full bg-current animate-bounce" />
+                  </span>
+                )}
+                <span className="truncate">{subtitle}</span>
               </p>
             </div>
           </button>
         </div>
 
         {/* Header Actions */}
-        <div className="flex items-center gap-1 shrink-0">
+        <div className="flex items-center gap-0.5 sm:gap-1 shrink-0">
           {(chat.type === 'private' || chat.type === 'group') && (
             <>
               <button
@@ -486,7 +532,7 @@ export function ChatWindow({
                 title={
                   chat.type === 'group' ? 'Групповой звонок' : 'Аудиозвонок P2P'
                 }
-                className="min-w-[40px] min-h-[40px] rounded-full flex items-center justify-center text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-[#232E3C] hover:text-emerald-500 transition-colors cursor-pointer"
+                className="min-w-[44px] min-h-[44px] sm:min-w-[40px] sm:min-h-[40px] rounded-full flex items-center justify-center text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-[#232E3C] hover:text-emerald-500 transition-colors cursor-pointer"
               >
                 <Phone className="w-[19px] h-[19px]" />
               </button>
@@ -504,7 +550,7 @@ export function ChatWindow({
                     ? 'Групповой видеозвонок'
                     : 'Видеозвонок P2P'
                 }
-                className="min-w-[40px] min-h-[40px] rounded-full flex items-center justify-center text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-[#232E3C] hover:text-[#3390EC] transition-colors cursor-pointer"
+                className="hidden sm:flex min-w-[40px] min-h-[40px] rounded-full items-center justify-center text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-[#232E3C] hover:text-[#3390EC] transition-colors cursor-pointer"
               >
                 <Video className="w-[19px] h-[19px]" />
               </button>
@@ -520,7 +566,7 @@ export function ChatWindow({
             }}
             aria-label="Поиск в чате"
             aria-pressed={chatSearchOpen}
-            className={`min-w-[40px] min-h-[40px] rounded-full flex items-center justify-center transition-colors cursor-pointer ${
+            className={`hidden sm:flex min-w-[40px] min-h-[40px] rounded-full items-center justify-center transition-colors cursor-pointer ${
               chatSearchOpen
                 ? 'bg-[#3390EC]/12 text-[#3390EC]'
                 : 'text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-[#232E3C]'
@@ -538,7 +584,7 @@ export function ChatWindow({
                 : 'Показать информацию о чате'
             }
             aria-pressed={showInfoPanel}
-            className={`min-w-[40px] min-h-[40px] rounded-full flex items-center justify-center transition-colors cursor-pointer ${
+            className={`hidden sm:flex min-w-[40px] min-h-[40px] rounded-full items-center justify-center transition-colors cursor-pointer ${
               showInfoPanel
                 ? 'bg-[#3390EC]/12 text-[#3390EC]'
                 : 'text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-[#232E3C]'
@@ -553,7 +599,7 @@ export function ChatWindow({
               onClick={() => setHeaderMenuOpen((o) => !o)}
               aria-label="Дополнительные действия чата"
               aria-expanded={headerMenuOpen}
-              className="min-w-[40px] min-h-[40px] rounded-full flex items-center justify-center text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-[#232E3C] transition-colors cursor-pointer"
+              className="min-w-[44px] min-h-[44px] sm:min-w-[40px] sm:min-h-[40px] rounded-full flex items-center justify-center text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-[#232E3C] transition-colors cursor-pointer"
             >
               <MoreVertical className="w-5 h-5" />
             </button>
@@ -563,6 +609,49 @@ export function ChatWindow({
                 role="menu"
                 className="absolute right-0 top-11 z-40 w-56 rounded-2xl bg-white dark:bg-[#17212B] shadow-xl border border-slate-200/80 dark:border-slate-700/70 p-1.5"
               >
+                <button
+                  type="button"
+                  role="menuitem"
+                  onClick={() => {
+                    onToggleInfoPanel();
+                    setHeaderMenuOpen(false);
+                  }}
+                  className="sm:hidden w-full flex items-center gap-2.5 px-3 py-2.5 text-[13.5px] text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-[#242F3D] rounded-xl cursor-pointer"
+                >
+                  <Info className="w-4 h-4 text-slate-500" />
+                  <span>Профиль и медиа</span>
+                </button>
+
+                <button
+                  type="button"
+                  role="menuitem"
+                  onClick={() => {
+                    setChatSearchOpen((prev) => !prev);
+                    setChatSearchQuery('');
+                    setActiveMatchIdx(0);
+                    setHeaderMenuOpen(false);
+                  }}
+                  className="sm:hidden w-full flex items-center gap-2.5 px-3 py-2.5 text-[13.5px] text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-[#242F3D] rounded-xl cursor-pointer"
+                >
+                  <Search className="w-4 h-4 text-slate-500" />
+                  <span>Поиск в чате</span>
+                </button>
+
+                {(chat.type === 'private' || chat.type === 'group') && (
+                  <button
+                    type="button"
+                    role="menuitem"
+                    onClick={() => {
+                      onStartCall(chat.id, 'video');
+                      setHeaderMenuOpen(false);
+                    }}
+                    className="sm:hidden w-full flex items-center gap-2.5 px-3 py-2.5 text-[13.5px] text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-[#242F3D] rounded-xl cursor-pointer"
+                  >
+                    <Video className="w-4 h-4 text-slate-500" />
+                    <span>Видеозвонок</span>
+                  </button>
+                )}
+
                 <button
                   type="button"
                   role="menuitem"
@@ -878,11 +967,11 @@ export function ChatWindow({
 
       {/* Composer Area */}
       {chat.canPost === false ? (
-        <div className="px-4 py-3 bg-white dark:bg-[#17212B] border-t border-slate-200/90 dark:border-[#0E1621] flex items-center justify-center">
+        <div className="px-4 py-3 pb-safe bg-white dark:bg-[#17212B] border-t border-slate-200/90 dark:border-[#0E1621] flex items-center justify-center">
           <button
             type="button"
             onClick={() => onUpdateChatFlags(chat.id, { muted: !chat.muted })}
-            className="px-6 py-2.5 rounded-xl text-sm font-semibold text-[#3390EC] dark:text-[#6AB3F3] hover:bg-[#3390EC]/10 transition-colors cursor-pointer"
+            className="min-h-[44px] px-6 py-2.5 rounded-xl text-sm font-semibold text-[#3390EC] dark:text-[#6AB3F3] hover:bg-[#3390EC]/10 transition-colors cursor-pointer"
           >
             {chat.muted
               ? 'Включить уведомления канала'
@@ -890,7 +979,7 @@ export function ChatWindow({
           </button>
         </div>
       ) : (
-        <div className="relative bg-white dark:bg-[#17212B] border-t border-slate-200/90 dark:border-[#0E1621] px-3 sm:px-5 py-2.5 shrink-0">
+        <div className="relative bg-white dark:bg-[#17212B] border-t border-slate-200/90 dark:border-[#0E1621] px-2.5 sm:px-5 py-2.5 pb-[max(0.625rem,env(safe-area-inset-bottom))] shrink-0">
           <div className="max-w-[760px] mx-auto">
             {uploadError && (
               <div
@@ -1182,7 +1271,7 @@ export function ChatWindow({
                   disabled={uploadingFile}
                   onClick={() => fileInputRef.current?.click()}
                   aria-label="Прикрепить файл или фото"
-                  className="min-w-[42px] min-h-[42px] rounded-full flex items-center justify-center text-slate-500 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-[#242F3D] hover:text-[#3390EC] transition-colors shrink-0 cursor-pointer disabled:opacity-50"
+                  className="min-w-[44px] min-h-[44px] rounded-full flex items-center justify-center text-slate-500 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-[#242F3D] hover:text-[#3390EC] transition-colors shrink-0 cursor-pointer disabled:opacity-50"
                 >
                   <Paperclip className="w-5 h-5" />
                 </button>
@@ -1192,7 +1281,7 @@ export function ChatWindow({
                   onClick={() => setPickerOpen((o) => !o)}
                   aria-label="Открыть эмодзи и стикеры"
                   aria-expanded={pickerOpen}
-                  className={`min-w-[42px] min-h-[42px] rounded-full flex items-center justify-center transition-colors shrink-0 cursor-pointer ${
+                  className={`min-w-[44px] min-h-[44px] rounded-full flex items-center justify-center transition-colors shrink-0 cursor-pointer ${
                     pickerOpen
                       ? 'text-[#3390EC] bg-[#3390EC]/10'
                       : 'text-slate-500 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-[#242F3D]'
@@ -1224,7 +1313,7 @@ export function ChatWindow({
                         : 'Написать сообщение (Ctrl+Enter — отправить)...'
                     }
                     aria-label="Поле ввода сообщения"
-                    className="w-full max-h-32 py-2.5 px-3 rounded-2xl bg-[#F1F4F7] dark:bg-[#242F3D] text-[14.5px] text-slate-900 dark:text-slate-100 placeholder:text-slate-500 dark:placeholder:text-slate-400 resize-none focus:outline-none focus:ring-2 focus:ring-[#3390EC]/40"
+                    className="w-full max-h-32 py-2.5 px-3 rounded-2xl bg-[#F1F4F7] dark:bg-[#242F3D] text-base sm:text-[14.5px] text-slate-900 dark:text-slate-100 placeholder:text-slate-500 dark:placeholder:text-slate-400 resize-none focus:outline-none focus:ring-2 focus:ring-[#3390EC]/40"
                   />
                 </div>
 
@@ -1235,7 +1324,7 @@ export function ChatWindow({
                     aria-label={
                       editingMsg ? 'Сохранить изменения' : 'Отправить сообщение'
                     }
-                    className="min-w-[42px] min-h-[42px] rounded-full active:scale-95 text-white flex items-center justify-center shrink-0 transition-all cursor-pointer"
+                    className="min-w-[44px] min-h-[44px] rounded-full active:scale-95 text-white flex items-center justify-center shrink-0 transition-all cursor-pointer"
                     style={{ backgroundColor: 'var(--tg-accent)' }}
                   >
                     <SendHorizontal className="w-5 h-5" />
@@ -1248,7 +1337,7 @@ export function ChatWindow({
                       setIsRecording(true);
                     }}
                     aria-label="Записать голосовое сообщение"
-                    className="min-w-[42px] min-h-[42px] rounded-full flex items-center justify-center text-slate-500 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-[#242F3D] hover:text-[#3390EC] transition-colors shrink-0 cursor-pointer"
+                    className="min-w-[44px] min-h-[44px] rounded-full flex items-center justify-center text-slate-500 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-[#242F3D] hover:text-[#3390EC] transition-colors shrink-0 cursor-pointer"
                   >
                     <Mic className="w-5 h-5" />
                   </button>

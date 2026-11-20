@@ -18,6 +18,7 @@ import {
   XCircle,
 } from 'lucide-react';
 import { Avatar } from './Avatar';
+import { PWAInstallButton } from './PWAInstallButton';
 import {
   ACCENT_PRESETS,
   AVATAR_COLORS,
@@ -370,7 +371,7 @@ export function SettingsModal({
   const totalStickers = stickerPacks.reduce((acc, p) => acc + p.stickers.length, 0);
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-5">
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-0 sm:p-5">
       <button
         type="button"
         aria-label="Закрыть настройки"
@@ -382,10 +383,10 @@ export function SettingsModal({
         role="dialog"
         aria-modal="true"
         aria-labelledby="tiligram-settings-title"
-        className="relative z-10 w-full max-w-4xl h-[86vh] max-h-[740px] rounded-2xl bg-white dark:bg-[#17212B] shadow-2xl border border-slate-200/80 dark:border-[#243242] flex flex-col overflow-hidden"
+        className="relative z-10 w-full max-w-4xl h-[100dvh] sm:h-[86vh] sm:max-h-[740px] rounded-none sm:rounded-2xl bg-white dark:bg-[#17212B] shadow-2xl border-0 sm:border border-slate-200/80 dark:border-[#243242] flex flex-col overflow-hidden pt-safe pb-safe"
       >
         {/* Top Bar */}
-        <div className="px-5 py-3.5 border-b border-slate-200/80 dark:border-[#0E1621] flex items-center justify-between shrink-0">
+        <div className="px-4 sm:px-5 py-3.5 border-b border-slate-200/80 dark:border-[#0E1621] flex items-center justify-between shrink-0">
           <h2
             id="tiligram-settings-title"
             className="font-display font-bold text-base text-slate-900 dark:text-slate-100"
@@ -396,7 +397,7 @@ export function SettingsModal({
             type="button"
             onClick={onClose}
             aria-label="Закрыть настройки"
-            className="w-8 h-8 rounded-full flex items-center justify-center text-slate-400 hover:bg-slate-100 dark:hover:bg-[#232E3C] cursor-pointer"
+            className="min-w-[44px] min-h-[44px] sm:min-w-[36px] sm:min-h-[36px] rounded-full flex items-center justify-center text-slate-400 hover:bg-slate-100 dark:hover:bg-[#232E3C] cursor-pointer"
           >
             <X className="w-5 h-5" />
           </button>
@@ -407,7 +408,7 @@ export function SettingsModal({
           {/* Categories Sidebar */}
           <nav
             aria-label="Разделы настроек"
-            className="w-full md:w-56 shrink-0 border-b md:border-b-0 md:border-r border-slate-200/80 dark:border-[#0E1621] p-2.5 bg-slate-50/70 dark:bg-[#131C26] flex md:flex-col gap-1 overflow-x-auto md:overflow-y-auto"
+            className="w-full md:w-56 shrink-0 border-b md:border-b-0 md:border-r border-slate-200/80 dark:border-[#0E1621] p-2.5 bg-slate-50/70 dark:bg-[#131C26] flex md:flex-col gap-1 overflow-x-auto md:overflow-y-auto no-scrollbar"
           >
             {TABS.map(({ id, label, Icon }) => {
               const active = tab === id;
@@ -522,7 +523,7 @@ export function SettingsModal({
                       type="text"
                       value={firstName}
                       onChange={(e) => setFirstName(e.target.value)}
-                      className="w-full h-10 px-3.5 rounded-xl bg-slate-100 dark:bg-[#0E1621] text-sm text-slate-900 dark:text-slate-100 border border-transparent focus:border-[var(--tg-accent)] focus:outline-none"
+                      className="w-full h-11 sm:h-10 px-3.5 rounded-xl bg-slate-100 dark:bg-[#0E1621] text-base sm:text-sm text-slate-900 dark:text-slate-100 border border-transparent focus:border-[var(--tg-accent)] focus:outline-none"
                     />
                   </div>
 
@@ -539,7 +540,7 @@ export function SettingsModal({
                       value={lastName}
                       onChange={(e) => setLastName(e.target.value)}
                       placeholder="Не указана"
-                      className="w-full h-10 px-3.5 rounded-xl bg-slate-100 dark:bg-[#0E1621] text-sm text-slate-900 dark:text-slate-100 border border-transparent focus:border-[var(--tg-accent)] focus:outline-none"
+                      className="w-full h-11 sm:h-10 px-3.5 rounded-xl bg-slate-100 dark:bg-[#0E1621] text-base sm:text-sm text-slate-900 dark:text-slate-100 border border-transparent focus:border-[var(--tg-accent)] focus:outline-none"
                     />
                   </div>
                 </div>
@@ -561,7 +562,7 @@ export function SettingsModal({
                       type="text"
                       value={username}
                       onChange={(e) => setUsername(e.target.value.replace(/^@+/, ''))}
-                      className="w-full h-10 pl-8 pr-10 rounded-xl bg-slate-100 dark:bg-[#0E1621] text-sm text-slate-900 dark:text-slate-100 border border-transparent focus:border-[var(--tg-accent)] focus:outline-none"
+                      className="w-full h-11 sm:h-10 pl-8 pr-10 rounded-xl bg-slate-100 dark:bg-[#0E1621] text-base sm:text-sm text-slate-900 dark:text-slate-100 border border-transparent focus:border-[var(--tg-accent)] focus:outline-none"
                     />
                     {usernameAvailable === true && (
                       <CheckCircle2 className="w-4 h-4 text-emerald-400 absolute right-3 top-1/2 -translate-y-1/2" />
@@ -592,7 +593,7 @@ export function SettingsModal({
                     value={bio}
                     onChange={(e) => setBio(e.target.value)}
                     placeholder="Пара слов о вас, профессии или интересах..."
-                    className="w-full p-3 rounded-xl bg-slate-100 dark:bg-[#0E1621] text-sm text-slate-900 dark:text-slate-100 resize-none border border-transparent focus:border-[var(--tg-accent)] focus:outline-none"
+                    className="w-full p-3 rounded-xl bg-slate-100 dark:bg-[#0E1621] text-base sm:text-sm text-slate-900 dark:text-slate-100 resize-none border border-transparent focus:border-[var(--tg-accent)] focus:outline-none"
                   />
                 </div>
 
@@ -610,7 +611,7 @@ export function SettingsModal({
                       type="date"
                       value={birthday}
                       onChange={(e) => setBirthday(e.target.value)}
-                      className="w-full h-10 px-3 rounded-xl bg-slate-100 dark:bg-[#0E1621] text-sm text-slate-900 dark:text-slate-100 border border-transparent focus:border-[var(--tg-accent)] focus:outline-none"
+                      className="w-full h-11 sm:h-10 px-3 rounded-xl bg-slate-100 dark:bg-[#0E1621] text-base sm:text-sm text-slate-900 dark:text-slate-100 border border-transparent focus:border-[var(--tg-accent)] focus:outline-none"
                     />
                   </div>
                   <div>
@@ -626,7 +627,7 @@ export function SettingsModal({
                       value={city}
                       onChange={(e) => setCity(e.target.value)}
                       placeholder="Москва"
-                      className="w-full h-10 px-3 rounded-xl bg-slate-100 dark:bg-[#0E1621] text-sm text-slate-900 dark:text-slate-100 border border-transparent focus:border-[var(--tg-accent)] focus:outline-none"
+                      className="w-full h-11 sm:h-10 px-3 rounded-xl bg-slate-100 dark:bg-[#0E1621] text-base sm:text-sm text-slate-900 dark:text-slate-100 border border-transparent focus:border-[var(--tg-accent)] focus:outline-none"
                     />
                   </div>
                   <div>
@@ -642,7 +643,7 @@ export function SettingsModal({
                       value={phone}
                       onChange={(e) => setPhone(e.target.value)}
                       placeholder="+7 999 000-00-00"
-                      className="w-full h-10 px-3 rounded-xl bg-slate-100 dark:bg-[#0E1621] text-sm text-slate-900 dark:text-slate-100 border border-transparent focus:border-[var(--tg-accent)] focus:outline-none"
+                      className="w-full h-11 sm:h-10 px-3 rounded-xl bg-slate-100 dark:bg-[#0E1621] text-base sm:text-sm text-slate-900 dark:text-slate-100 border border-transparent focus:border-[var(--tg-accent)] focus:outline-none"
                     />
                   </div>
                 </div>
@@ -1319,6 +1320,9 @@ export function SettingsModal({
                     </div>
                   )}
                 </div>
+
+                {/* Mobile PWA Installation Card */}
+                <PWAInstallButton variant="card" />
               </div>
             )}
 

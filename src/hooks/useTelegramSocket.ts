@@ -37,6 +37,7 @@ export interface TelegramSyncApi {
   activeCalls: ActiveCallRoom[];
   typingByChat: Record<string, TypingState | undefined>;
   onlineClientCount: number;
+  directoryVersion: number;
   sendMessage: (params: {
     chatId: string;
     kind: MessageKind;
@@ -156,10 +157,13 @@ export function useTelegramSocket({
     Record<string, TypingState | undefined>
   >({});
   const [onlineClientCount, setOnlineClientCount] = useState(1);
+  const [directoryVersion, setDirectoryVersion] = useState(0);
 
   const wsRef = useRef<WebSocket | null>(null);
   const pendingQueueRef = useRef<ClientWsEvent[]>([]);
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const chatsRef = useRef(chats);
+  chatsRef.current = chats;
   const currentUserRef = useRef(currentUser);
   currentUserRef.current = currentUser;
   const onAuthExpiredRef = useRef(onAuthExpired);
@@ -200,9 +204,31 @@ export function useTelegramSocket({
     }
 
     let disposed = false;
+    let reconnectAttempt = 0;
+    let pingInterval: ReturnType<typeof setInterval> | null = null;
+    let pongTimeout: ReturnType<typeof setTimeout> | null = null;
+
+    function clearHeartbeat() {
+      if (pingInterval) {
+        clearInterval(pingInterval);
+        pingInterval = null;
+      }
+      if (pongTimeout) {
+        clearTimeout(pongTimeout);
+        pongTimeout = null;
+      }
+    }
 
     function connect() {
       if (disposed || !token) return;
+      if (
+        wsRef.current &&
+        (wsRef.current.readyState === WebSocket.OPEN ||
+          wsRef.current.readyState === WebSocket.CONNECTING)
+      ) {
+        return;
+      }
+
       const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
       const wsUrl = `${protocol}//${window.location.host}/ws`;
       const socket = new WebSocket(wsUrl);
@@ -210,18 +236,45 @@ export function useTelegramSocket({
 
       socket.onopen = () => {
         if (disposed) return;
+        reconnectAttempt = 0;
         setConnected(true);
         socket.send(JSON.stringify({ type: 'client:auth', token } satisfies ClientWsEvent));
         while (pendingQueueRef.current.length > 0) {
           const queued = pendingQueueRef.current.shift();
           if (queued) socket.send(JSON.stringify(queued));
         }
+
+        clearHeartbeat();
+        pingInterval = setInterval(() => {
+          if (socket.readyState !== WebSocket.OPEN) return;
+          try {
+            socket.send(
+              JSON.stringify({ type: 'client:ping', ts: Date.now() } satisfies ClientWsEvent),
+            );
+            if (pongTimeout) clearTimeout(pongTimeout);
+            pongTimeout = setTimeout(() => {
+              // Stale / half-open socket -> force immediate reconnect
+              if (socket.readyState === WebSocket.OPEN) {
+                socket.close();
+              }
+            }, 10_000);
+          } catch {
+            socket.close();
+          }
+        }, 20_000);
       };
 
       socket.onmessage = (ev) => {
         try {
           const msg = JSON.parse(ev.data) as ServerWsEvent;
           switch (msg.type) {
+            case 'server:pong': {
+              if (pongTimeout) {
+                clearTimeout(pongTimeout);
+                pongTimeout = null;
+              }
+              break;
+            }
             case 'auth:error': {
               onAuthExpiredRef.current();
               break;
@@ -255,6 +308,7 @@ export function useTelegramSocket({
               setStickerPacks(msg.payload.stickerPacks);
               setActiveCalls(msg.payload.activeCalls ?? []);
               setOnlineClientCount(msg.payload.onlineClientCount);
+              setDirectoryVersion((v) => v + 1);
               setInitialized(true);
               break;
             }
@@ -271,6 +325,16 @@ export function useTelegramSocket({
                 const exists = prev.some((c) => c.id === chat.id);
                 if (!exists) return [chat, ...prev];
                 return prev.map((c) => (c.id === chat.id ? { ...c, ...chat } : c));
+              });
+              // Clear typing indicator for the user who just sent the message
+              setTypingByChat((prev) => {
+                const current = prev[message.chatId];
+                if (current && current.userId === message.senderId) {
+                  const next = { ...prev };
+                  delete next[message.chatId];
+                  return next;
+                }
+                return prev;
               });
               if (
                 currentUserRef.current &&
@@ -301,11 +365,36 @@ export function useTelegramSocket({
               );
               break;
             }
+            case 'messages:read': {
+              const { chatId, messageIds, readerId } = msg.payload;
+              const idSet = new Set(messageIds);
+              setMessagesByChat((prev) => {
+                const list = prev[chatId];
+                if (!list || list.length === 0) return prev;
+                let changed = false;
+                const nextList = list.map((m) => {
+                  if (!idSet.has(m.id)) return m;
+                  changed = true;
+                  const readBy = m.readBy ?? [];
+                  return {
+                    ...m,
+                    status: 'read' as const,
+                    readBy: readBy.includes(readerId) ? readBy : [...readBy, readerId],
+                  };
+                });
+                return changed ? { ...prev, [chatId]: nextList } : prev;
+              });
+              break;
+            }
             case 'chat:created': {
               const { chat, messages } = msg.payload;
-              setChats((prev) =>
-                prev.some((c) => c.id === chat.id) ? prev : [chat, ...prev],
-              );
+              setChats((prev) => {
+                const idx = prev.findIndex((c) => c.id === chat.id);
+                if (idx >= 0) {
+                  return prev.map((c) => (c.id === chat.id ? { ...c, ...chat } : c));
+                }
+                return [chat, ...prev];
+              });
               setMessagesByChat((prev) => ({
                 ...prev,
                 [chat.id]: prev[chat.id]?.length ? prev[chat.id] : messages,
@@ -329,6 +418,9 @@ export function useTelegramSocket({
             }
             case 'typing:update': {
               const { chatId, userId, userName, isTyping } = msg.payload;
+              if (currentUserRef.current && userId === currentUserRef.current.id) {
+                break;
+              }
               setTypingByChat((prev) => {
                 if (!isTyping) {
                   const next = { ...prev };
@@ -341,14 +433,135 @@ export function useTelegramSocket({
                     chatId,
                     userId,
                     userName,
-                    expiresAt: Date.now() + 4000,
+                    expiresAt: Date.now() + 4500,
                   },
                 };
               });
               break;
             }
+            case 'presence:update': {
+              const { userId, online, lastSeenAt, lastSeenText } = msg.payload;
+              const meId = currentUserRef.current?.id;
+              setChats((prev) =>
+                prev.map((chat) => {
+                  if (
+                    chat.type === 'private' &&
+                    userId !== meId &&
+                    chat.participantIds?.includes(userId)
+                  ) {
+                    return {
+                      ...chat,
+                      online,
+                      lastSeenAt,
+                      lastSeenText,
+                    };
+                  }
+                  if (
+                    chat.type === 'group' &&
+                    chat.members?.some((m) => m.id === userId)
+                  ) {
+                    return {
+                      ...chat,
+                      members: chat.members.map((m) =>
+                        m.id === userId
+                          ? { ...m, online, lastSeenAt, lastSeenText }
+                          : m,
+                      ),
+                    };
+                  }
+                  return chat;
+                }),
+              );
+              setDirectoryVersion((v) => v + 1);
+              break;
+            }
+            case 'user:profile_changed': {
+              const { user } = msg.payload;
+              const meId = currentUserRef.current?.id;
+              setChats((prev) =>
+                prev.map((chat) => {
+                  if (
+                    chat.type === 'private' &&
+                    user.id !== meId &&
+                    chat.participantIds?.includes(user.id)
+                  ) {
+                    return {
+                      ...chat,
+                      title: user.name,
+                      username: user.username,
+                      bio: user.bio,
+                      phone: user.phone,
+                      birthday: user.birthday,
+                      city: user.city,
+                      statusEmoji: user.statusEmoji,
+                      avatarUrl: user.avatarUrl,
+                      avatarColor: user.avatarColor,
+                      profileAccent: user.profileAccent,
+                      peerUserId: user.id,
+                      createdAt: user.createdAt ?? chat.createdAt,
+                      online: user.online,
+                      lastSeenAt: user.lastSeenAt,
+                      lastSeenText: user.lastSeenText,
+                    };
+                  }
+                  if (
+                    chat.type === 'group' &&
+                    chat.members?.some((m) => m.id === user.id)
+                  ) {
+                    return {
+                      ...chat,
+                      members: chat.members.map((m) =>
+                        m.id === user.id
+                          ? {
+                              ...m,
+                              name: user.name,
+                              username: user.username,
+                              bio: user.bio,
+                              phone: user.phone,
+                              birthday: user.birthday,
+                              city: user.city,
+                              statusEmoji: user.statusEmoji,
+                              avatarUrl: user.avatarUrl,
+                              avatarColor: user.avatarColor,
+                              profileAccent: user.profileAccent,
+                              online: user.online,
+                              lastSeenAt: user.lastSeenAt,
+                              lastSeenText: user.lastSeenText,
+                              createdAt: user.createdAt ?? m.createdAt,
+                            }
+                          : m,
+                      ),
+                    };
+                  }
+                  return chat;
+                }),
+              );
+              setDirectoryVersion((v) => v + 1);
+              break;
+            }
+            case 'directory:updated': {
+              setDirectoryVersion((v) => v + 1);
+              break;
+            }
             case 'profile:updated': {
-              setCurrentUser(msg.payload.user);
+              const updatedUser = msg.payload.user;
+              setCurrentUser(updatedUser);
+              setChats((prev) =>
+                prev.map((chat) =>
+                  chat.type === 'saved'
+                    ? {
+                        ...chat,
+                        username: updatedUser.username,
+                        phone: updatedUser.phone,
+                        birthday: updatedUser.birthday,
+                        city: updatedUser.city,
+                        statusEmoji: updatedUser.statusEmoji,
+                        profileAccent: updatedUser.profileAccent,
+                        createdAt: updatedUser.createdAt ?? chat.createdAt,
+                      }
+                    : chat,
+                ),
+              );
               break;
             }
             case 'settings:updated': {
@@ -404,9 +617,12 @@ export function useTelegramSocket({
       };
 
       socket.onclose = () => {
+        clearHeartbeat();
         if (disposed) return;
         setConnected(false);
-        reconnectTimerRef.current = setTimeout(connect, 1800);
+        const delay = Math.min(4000, 700 + reconnectAttempt * 600);
+        reconnectAttempt += 1;
+        reconnectTimerRef.current = setTimeout(connect, delay);
       };
 
       socket.onerror = () => {
@@ -414,10 +630,42 @@ export function useTelegramSocket({
       };
     }
 
+    const ensureConnected = () => {
+      if (disposed) return;
+      const socket = wsRef.current;
+      if (!socket || socket.readyState === WebSocket.CLOSED) {
+        if (reconnectTimerRef.current) {
+          clearTimeout(reconnectTimerRef.current);
+          reconnectTimerRef.current = null;
+        }
+        connect();
+      } else if (socket.readyState === WebSocket.OPEN) {
+        try {
+          socket.send(
+            JSON.stringify({ type: 'client:ping', ts: Date.now() } satisfies ClientWsEvent),
+          );
+        } catch {
+          socket.close();
+        }
+      }
+    };
+
+    const handleVisibility = () => {
+      if (!document.hidden) ensureConnected();
+    };
+
+    window.addEventListener('online', ensureConnected);
+    window.addEventListener('focus', ensureConnected);
+    document.addEventListener('visibilitychange', handleVisibility);
+
     connect();
 
     return () => {
       disposed = true;
+      clearHeartbeat();
+      window.removeEventListener('online', ensureConnected);
+      window.removeEventListener('focus', ensureConnected);
+      document.removeEventListener('visibilitychange', handleVisibility);
       if (reconnectTimerRef.current) clearTimeout(reconnectTimerRef.current);
       if (wsRef.current) wsRef.current.close();
     };
@@ -446,6 +694,7 @@ export function useTelegramSocket({
     ({ chatId, kind, text, replyToId, forwardedFrom, attachment }) => {
       const me = currentUserRef.current;
       if (!me) return;
+      const targetChat = chatsRef.current.find((c) => c.id === chatId);
       const id = `msg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
       const nowIso = new Date().toISOString();
       const optimistic: ChatMessage = {
@@ -457,7 +706,8 @@ export function useTelegramSocket({
         kind,
         text: text.trim(),
         createdAt: nowIso,
-        status: 'sent',
+        status: targetChat?.type === 'saved' ? 'read' : 'sent',
+        readBy: [me.id],
         replyToId,
         forwardedFrom,
         reactions: [],
@@ -618,6 +868,19 @@ export function useTelegramSocket({
   const createChat = useCallback<TelegramSyncApi['createChat']>(
     ({ type, title, bio, username, avatarColor, targetUserId, memberNames }) => {
       const me = currentUserRef.current;
+      if (type === 'private' && targetUserId && me) {
+        const existing = chatsRef.current.find(
+          (c) =>
+            c.type === 'private' &&
+            c.participantIds &&
+            c.participantIds.includes(me.id) &&
+            c.participantIds.includes(targetUserId),
+        );
+        if (existing) {
+          return existing.id;
+        }
+      }
+
       const id = `chat-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
       const nowIso = new Date().toISOString();
       const optimisticChat: ChatThread = {
@@ -629,8 +892,8 @@ export function useTelegramSocket({
         avatarColor,
         ownerId: me?.id,
         participantIds: targetUserId && me ? [me.id, targetUserId] : me ? [me.id] : [],
-        online: type === 'private',
-        lastSeenText: type === 'private' ? 'в сети' : undefined,
+        online: false,
+        lastSeenText: type === 'private' ? 'был(а) недавно' : undefined,
         memberCount:
           type === 'group'
             ? 1 + (memberNames?.length ?? 0)
@@ -911,6 +1174,7 @@ export function useTelegramSocket({
     activeCalls,
     typingByChat,
     onlineClientCount,
+    directoryVersion,
     sendMessage,
     editMessage,
     deleteMessage,

@@ -160,6 +160,7 @@ export interface UserProfile {
   profileAccent: string;
   online: boolean;
   lastSeen: string;
+  createdAt?: string;
 }
 
 export interface PublicUserSummary {
@@ -169,10 +170,17 @@ export interface PublicUserSummary {
   name: string;
   username: string;
   bio: string;
+  phone?: string;
+  birthday?: string;
+  city?: string;
   avatarUrl?: string;
   avatarColor: string;
+  profileAccent?: string;
   statusEmoji: string;
   online: boolean;
+  lastSeenAt?: string;
+  lastSeenText?: string;
+  createdAt?: string;
 }
 
 export interface ChatMember {
@@ -180,9 +188,18 @@ export interface ChatMember {
   name: string;
   username: string;
   role?: 'owner' | 'admin' | 'member';
+  bio?: string;
+  phone?: string;
+  birthday?: string;
+  city?: string;
+  statusEmoji?: string;
   avatarUrl?: string;
   avatarColor: string;
+  profileAccent?: string;
   online: boolean;
+  lastSeenAt?: string;
+  lastSeenText?: string;
+  createdAt?: string;
 }
 
 export interface MessageReaction {
@@ -221,6 +238,7 @@ export interface ChatMessage {
   createdAt: string;
   editedAt?: string;
   status: 'sent' | 'read';
+  readBy?: string[];
   replyToId?: string;
   forwardedFrom?: string;
   reactions: MessageReaction[];
@@ -233,10 +251,18 @@ export interface ChatThread {
   title: string;
   username?: string;
   bio?: string;
+  phone?: string;
+  birthday?: string;
+  city?: string;
+  statusEmoji?: string;
   avatarUrl?: string;
   avatarColor: string;
+  profileAccent?: string;
+  peerUserId?: string;
+  createdAt?: string;
   verified?: boolean;
   online?: boolean;
+  lastSeenAt?: string;
   lastSeenText?: string;
   ownerId?: string;
   participantIds?: string[];
@@ -294,6 +320,7 @@ export interface TypingState {
 
 export type ClientWsEvent =
   | { type: 'client:auth'; token: string }
+  | { type: 'client:ping'; ts: number }
   | {
       type: 'message:send';
       payload: {
@@ -414,12 +441,22 @@ export type ClientWsEvent =
 
 export type ServerWsEvent =
   | { type: 'sync:init'; payload: ServerStateSnapshot }
+  | { type: 'server:pong'; ts: number }
   | { type: 'auth:error'; payload: { message: string } }
   | { type: 'message:created'; payload: { message: ChatMessage; chat: ChatThread } }
   | { type: 'message:updated'; payload: { message: ChatMessage } }
   | {
       type: 'message:deleted';
       payload: { chatId: string; messageId: string; chat: ChatThread };
+    }
+  | {
+      type: 'messages:read';
+      payload: {
+        chatId: string;
+        messageIds: string[];
+        readerId: string;
+        readAt: string;
+      };
     }
   | { type: 'chat:created'; payload: { chat: ChatThread; messages: ChatMessage[] } }
   | { type: 'chat:updated'; payload: { chat: ChatThread } }
@@ -429,6 +466,17 @@ export type ServerWsEvent =
       payload: { chatId: string; userId: string; userName: string; isTyping: boolean };
     }
   | { type: 'profile:updated'; payload: { user: UserProfile } }
+  | { type: 'user:profile_changed'; payload: { user: PublicUserSummary } }
+  | { type: 'directory:updated'; payload: { user: PublicUserSummary } }
+  | {
+      type: 'presence:update';
+      payload: {
+        userId: string;
+        online: boolean;
+        lastSeenAt?: string;
+        lastSeenText: string;
+      };
+    }
   | { type: 'settings:updated'; payload: { settings: AppSettings } }
   | { type: 'stickers:updated'; payload: { stickerPacks: StickerPack[] } }
   | { type: 'presence:count'; payload: { onlineClientCount: number } }

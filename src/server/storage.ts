@@ -11,7 +11,7 @@ import {
   formatFileSize,
   isFileExpired,
 } from '../utils/fileRetention.ts';
-import { buildFullName } from '../utils/chatLogic.ts';
+import { buildFullName, formatLastSeen } from '../utils/chatLogic.ts';
 import type {
   AppSettings,
   ChatMessage,
@@ -107,13 +107,43 @@ function loadLocalDb(): PersistedDatabase {
   return createEmptyDb();
 }
 
+export type ClusterSyncEvent =
+  | { type: 'account:upsert'; account: StoredAccount }
+  | { type: 'chat:upsert'; chat: ChatThread; messages?: ChatMessage[] }
+  | { type: 'message:upsert'; message: ChatMessage; chat: ChatThread }
+  | { type: 'message:delete'; chatId: string; messageId: string; chat: ChatThread }
+  | { type: 'chat:clear'; chatId: string; chat: ChatThread }
+  | { type: 'messages:read'; chatId: string; messageIds: string[]; readerId: string; readAt: string }
+  | { type: 'typing:update'; chatId: string; userId: string; userName: string; isTyping: boolean }
+  | { type: 'presence:update'; userId: string; online: boolean; lastSeenAt: string }
+  | { type: 'stickers:updated'; stickerPacks: StickerPack[] };
+
+function deriveStableTokenSecret(fallback: string): string {
+  const seed = (
+    process.env.SESSION_SECRET ||
+    process.env.SUPABASE_SERVICE_ROLE_KEY ||
+    process.env.SUPABASE_SECRET_KEY ||
+    ''
+  ).trim();
+  if (!seed) return fallback;
+  return crypto
+    .createHash('sha256')
+    .update(`tiligram-token-secret-v1:${seed}`)
+    .digest('hex');
+}
+
 export class TiligramStorage {
   private db: PersistedDatabase;
   private persistTimer: ReturnType<typeof setTimeout> | null = null;
   private supabase: SupabaseClient | null = null;
+  private clusterChannel: ReturnType<SupabaseClient['channel']> | null = null;
+  private readonly instanceId = `inst-${crypto.randomBytes(6).toString('hex')}`;
+  private lastAccountsRefreshMs = 0;
+  public readonly ready: Promise<void>;
 
   constructor() {
     this.db = loadLocalDb();
+    this.db.tokenSecret = deriveStableTokenSecret(this.db.tokenSecret);
 
     const stripQuotes = (v?: string) => v?.trim().replace(/^["']|["']$/g, '') ?? '';
     const sbUrl = stripQuotes(
@@ -128,7 +158,153 @@ export class TiligramStorage {
       this.supabase = createClient(sbUrl, sbKey, {
         auth: { persistSession: false, autoRefreshToken: false },
       });
-      void this.hydrateFromSupabase();
+      this.ready = this.hydrateFromSupabase();
+    } else {
+      this.ready = Promise.resolve();
+    }
+  }
+
+  public startClusterSync(onRemoteEvent: (event: ClusterSyncEvent) => void): void {
+    if (!this.supabase || this.clusterChannel) return;
+    try {
+      const channel = this.supabase.channel('tiligram-cluster-v1', {
+        config: { broadcast: { self: false } },
+      });
+      channel
+        .on('broadcast', { event: 'sync' }, (payload: { payload?: { origin?: string; data?: ClusterSyncEvent } }) => {
+          const envelope = payload?.payload;
+          if (!envelope || envelope.origin === this.instanceId || !envelope.data) return;
+          this.applyClusterEventToCache(envelope.data);
+          onRemoteEvent(envelope.data);
+        })
+        .subscribe();
+      this.clusterChannel = channel;
+    } catch (err) {
+      console.warn('Supabase Realtime cluster channel skipped:', err);
+    }
+  }
+
+  public publishClusterEvent(data: ClusterSyncEvent): void {
+    if (!this.clusterChannel) return;
+    void this.clusterChannel
+      .send({
+        type: 'broadcast',
+        event: 'sync',
+        payload: { origin: this.instanceId, data },
+      })
+      .catch(() => {
+        // non-fatal on single instance
+      });
+  }
+
+  private applyClusterEventToCache(evt: ClusterSyncEvent): void {
+    switch (evt.type) {
+      case 'account:upsert': {
+        const idx = this.db.accounts.findIndex((a) => a.id === evt.account.id);
+        if (idx === -1) this.db.accounts.push(evt.account);
+        else this.db.accounts[idx] = evt.account;
+        break;
+      }
+      case 'chat:upsert': {
+        const idx = this.db.chats.findIndex((c) => c.id === evt.chat.id);
+        if (idx === -1) this.db.chats.unshift(evt.chat);
+        else this.db.chats[idx] = evt.chat;
+        if (evt.messages) {
+          this.db.messagesByChat[evt.chat.id] = evt.messages;
+        } else if (!this.db.messagesByChat[evt.chat.id]) {
+          this.db.messagesByChat[evt.chat.id] = [];
+        }
+        break;
+      }
+      case 'message:upsert': {
+        const list = this.db.messagesByChat[evt.message.chatId] ?? [];
+        const idx = list.findIndex((m) => m.id === evt.message.id);
+        if (idx === -1) list.push(evt.message);
+        else list[idx] = evt.message;
+        this.db.messagesByChat[evt.message.chatId] = list;
+        const cIdx = this.db.chats.findIndex((c) => c.id === evt.chat.id);
+        if (cIdx === -1) this.db.chats.unshift(evt.chat);
+        else this.db.chats[cIdx] = evt.chat;
+        break;
+      }
+      case 'message:delete': {
+        const list = this.db.messagesByChat[evt.chatId] ?? [];
+        this.db.messagesByChat[evt.chatId] = list.filter((m) => m.id !== evt.messageId);
+        const cIdx = this.db.chats.findIndex((c) => c.id === evt.chat.id);
+        if (cIdx !== -1) this.db.chats[cIdx] = evt.chat;
+        break;
+      }
+      case 'chat:clear': {
+        this.db.messagesByChat[evt.chatId] = [];
+        const cIdx = this.db.chats.findIndex((c) => c.id === evt.chat.id);
+        if (cIdx !== -1) this.db.chats[cIdx] = evt.chat;
+        break;
+      }
+      case 'messages:read': {
+        const list = this.db.messagesByChat[evt.chatId] ?? [];
+        const idSet = new Set(evt.messageIds);
+        for (const m of list) {
+          if (idSet.has(m.id)) {
+            m.status = 'read';
+            const readBy = m.readBy ?? [];
+            if (!readBy.includes(evt.readerId)) {
+              m.readBy = [...readBy, evt.readerId];
+            }
+          }
+        }
+        break;
+      }
+      case 'presence:update': {
+        const acc = this.getAccountById(evt.userId);
+        if (acc && evt.lastSeenAt) {
+          acc.lastSeenAt = evt.lastSeenAt;
+        }
+        break;
+      }
+      case 'stickers:updated': {
+        this.db.stickerPacks = evt.stickerPacks;
+        break;
+      }
+    }
+  }
+
+  public async refreshAccountsFromSupabase(force = false): Promise<void> {
+    if (!this.supabase) return;
+    const now = Date.now();
+    if (!force && now - this.lastAccountsRefreshMs < 1500) return;
+    this.lastAccountsRefreshMs = now;
+    try {
+      const { data, error } = await this.supabase.from('tiligram_accounts').select('*');
+      if (!error && Array.isArray(data)) {
+        const remoteMap = new Map<string, StoredAccount>();
+        for (const r of data as any[]) {
+          remoteMap.set(r.id, {
+            id: r.id,
+            firstName: r.first_name,
+            lastName: r.last_name ?? '',
+            username: r.username,
+            passwordHash: r.password_hash,
+            passwordSalt: r.password_salt,
+            bio: r.bio ?? '',
+            phone: r.phone ?? '',
+            birthday: r.birthday ?? '',
+            city: r.city ?? '',
+            statusEmoji: r.status_emoji ?? '',
+            avatarUrl: r.avatar_url ?? undefined,
+            avatarColor: r.avatar_color ?? '#3390EC',
+            profileAccent: r.profile_accent ?? '#3390EC',
+            settings: { ...DEFAULT_APP_SETTINGS, ...(r.settings ?? {}) },
+            createdAt: r.created_at,
+            lastSeenAt: r.last_seen_at,
+          });
+        }
+        for (const local of this.db.accounts) {
+          if (!remoteMap.has(local.id)) remoteMap.set(local.id, local);
+        }
+        this.db.accounts = Array.from(remoteMap.values());
+      }
+    } catch {
+      // ignore transient network errors
     }
   }
 
@@ -431,6 +607,26 @@ export class TiligramStorage {
   }
 
   // --- Account Operations ---
+  public isLastSeenHidden(acc: StoredAccount): boolean {
+    return acc.settings?.privacy?.lastSeen === 'nobody';
+  }
+
+  public getPresenceForAccount(
+    acc: StoredAccount,
+    onlineUserIds: Set<string>,
+  ): { online: boolean; lastSeenAt?: string; lastSeenText: string } {
+    const hidden = this.isLastSeenHidden(acc);
+    if (hidden) {
+      return { online: false, lastSeenAt: undefined, lastSeenText: 'был(а) недавно' };
+    }
+    const isOnline = onlineUserIds.has(acc.id);
+    return {
+      online: isOnline,
+      lastSeenAt: acc.lastSeenAt,
+      lastSeenText: formatLastSeen(acc.lastSeenAt, isOnline, false),
+    };
+  }
+
   public toUserProfile(acc: StoredAccount, isOnline = true): UserProfile {
     return {
       id: acc.id,
@@ -447,8 +643,45 @@ export class TiligramStorage {
       avatarColor: acc.avatarColor,
       profileAccent: acc.profileAccent,
       online: isOnline,
-      lastSeen: isOnline ? 'в сети' : 'был(а) недавно',
+      lastSeen: formatLastSeen(acc.lastSeenAt, isOnline, false),
+      createdAt: acc.createdAt,
     };
+  }
+
+  public toPublicUserSummary(
+    acc: StoredAccount,
+    onlineUserIds: Set<string> = new Set(),
+  ): PublicUserSummary {
+    const presence = this.getPresenceForAccount(acc, onlineUserIds);
+    const hideBirthday = acc.settings?.privacy?.birthday === 'nobody';
+    return {
+      id: acc.id,
+      firstName: acc.firstName,
+      lastName: acc.lastName,
+      name: buildFullName(acc.firstName, acc.lastName),
+      username: `@${acc.username}`,
+      bio: acc.bio,
+      phone: acc.phone,
+      birthday: hideBirthday ? '' : acc.birthday,
+      city: acc.city,
+      avatarUrl: acc.avatarUrl,
+      avatarColor: acc.avatarColor,
+      profileAccent: acc.profileAccent,
+      statusEmoji: acc.statusEmoji,
+      online: presence.online,
+      lastSeenAt: presence.lastSeenAt,
+      lastSeenText: presence.lastSeenText,
+      createdAt: acc.createdAt,
+    };
+  }
+
+  public touchAccountLastSeen(userId: string): StoredAccount | null {
+    const acc = this.getAccountById(userId);
+    if (!acc) return null;
+    acc.lastSeenAt = new Date().toISOString();
+    this.scheduleLocalPersist();
+    void this.syncAccountToSupabase(acc);
+    return acc;
   }
 
   public isUsernameAvailable(username: string, excludeUserId?: string): boolean {
@@ -467,7 +700,11 @@ export class TiligramStorage {
     return this.db.accounts.find((a) => a.username.toLowerCase() === lower);
   }
 
-  public searchAccounts(query: string, excludeUserId: string): PublicUserSummary[] {
+  public searchAccounts(
+    query: string,
+    excludeUserId: string,
+    onlineUserIds: Set<string> = new Set(),
+  ): PublicUserSummary[] {
     const q = query.trim().replace(/^@+/, '').toLowerCase();
     return this.db.accounts
       .filter((a) => {
@@ -476,19 +713,8 @@ export class TiligramStorage {
         const fullName = buildFullName(a.firstName, a.lastName).toLowerCase();
         return a.username.toLowerCase().includes(q) || fullName.includes(q);
       })
-      .slice(0, 20)
-      .map((a) => ({
-        id: a.id,
-        firstName: a.firstName,
-        lastName: a.lastName,
-        name: buildFullName(a.firstName, a.lastName),
-        username: `@${a.username}`,
-        bio: a.bio,
-        avatarUrl: a.avatarUrl,
-        avatarColor: a.avatarColor,
-        statusEmoji: a.statusEmoji,
-        online: true,
-      }));
+      .slice(0, 30)
+      .map((a) => this.toPublicUserSummary(a, onlineUserIds));
   }
 
   public registerAccount(params: {
@@ -615,37 +841,161 @@ export class TiligramStorage {
   }
 
   // --- Chats & Messages ---
-  public getChatsForUser(userId: string): ChatThread[] {
+  public computeUnreadCountForUser(chat: ChatThread, userId: string): number {
+    if (chat.type === 'saved') return 0;
+    const msgs = this.db.messagesByChat[chat.id] ?? [];
+    let count = 0;
+    for (const m of msgs) {
+      if (m.senderId === userId) continue;
+      if (m.status === 'read' || m.readBy?.includes(userId)) continue;
+      count += 1;
+    }
+    return count;
+  }
+
+  public decorateChatForUser(
+    chat: ChatThread,
+    userId: string,
+    onlineUserIds: Set<string> = new Set(),
+  ): ChatThread {
+    const unreadCount = this.computeUnreadCountForUser(chat, userId);
+
+    // For 1-on-1 chats between two real accounts, dynamically display the other user's live profile & presence
+    if (
+      chat.type === 'private' &&
+      chat.participantIds &&
+      chat.participantIds.length === 2
+    ) {
+      const otherId = chat.participantIds.find((id) => id !== userId);
+      const other = otherId ? this.getAccountById(otherId) : undefined;
+      if (other) {
+        const presence = this.getPresenceForAccount(other, onlineUserIds);
+        const hideBirthday = other.settings?.privacy?.birthday === 'nobody';
+        return {
+          ...chat,
+          title: buildFullName(other.firstName, other.lastName),
+          username: `@${other.username}`,
+          bio: other.bio,
+          phone: other.phone,
+          birthday: hideBirthday ? '' : other.birthday,
+          city: other.city,
+          statusEmoji: other.statusEmoji,
+          avatarUrl: other.avatarUrl,
+          avatarColor: other.avatarColor,
+          profileAccent: other.profileAccent,
+          peerUserId: other.id,
+          createdAt: other.createdAt,
+          online: presence.online,
+          lastSeenAt: presence.lastSeenAt,
+          lastSeenText: presence.lastSeenText,
+          unreadCount,
+        };
+      }
+    }
+
+    if (chat.type === 'saved') {
+      const owner = this.getAccountById(userId);
+      if (owner) {
+        return {
+          ...chat,
+          username: `@${owner.username}`,
+          phone: owner.phone,
+          birthday: owner.birthday,
+          city: owner.city,
+          statusEmoji: owner.statusEmoji,
+          profileAccent: owner.profileAccent,
+          createdAt: owner.createdAt,
+          unreadCount,
+        };
+      }
+    }
+
+    if (chat.type === 'group' && chat.members && chat.members.length > 0) {
+      const members = chat.members.map((mem) => {
+        const acc = this.getAccountById(mem.id);
+        if (!acc) return mem;
+        const presence = this.getPresenceForAccount(acc, onlineUserIds);
+        const hideBirthday = acc.settings?.privacy?.birthday === 'nobody';
+        return {
+          ...mem,
+          name: buildFullName(acc.firstName, acc.lastName),
+          username: `@${acc.username}`,
+          bio: acc.bio,
+          phone: acc.phone,
+          birthday: hideBirthday ? '' : acc.birthday,
+          city: acc.city,
+          statusEmoji: acc.statusEmoji,
+          avatarUrl: acc.avatarUrl,
+          avatarColor: acc.avatarColor,
+          profileAccent: acc.profileAccent,
+          online: presence.online,
+          lastSeenAt: presence.lastSeenAt,
+          lastSeenText: presence.lastSeenText,
+          createdAt: acc.createdAt,
+        };
+      });
+      return {
+        ...chat,
+        members,
+        memberCount: members.length,
+        unreadCount,
+      };
+    }
+
+    return {
+      ...chat,
+      unreadCount,
+    };
+  }
+
+  public getChatsForUser(
+    userId: string,
+    onlineUserIds: Set<string> = new Set(),
+  ): ChatThread[] {
     return this.db.chats
       .filter((c) => {
         if (c.ownerId === userId) return true;
         if (c.participantIds?.includes(userId)) return true;
         return false;
       })
-      .map((chat) => {
-        // For 1-on-1 chats between two real accounts, dynamically display the other user's name/avatar!
-        if (
-          chat.type === 'private' &&
-          chat.participantIds &&
-          chat.participantIds.length === 2
-        ) {
-          const otherId = chat.participantIds.find((id) => id !== userId);
-          const other = otherId ? this.getAccountById(otherId) : undefined;
-          if (other) {
-            return {
-              ...chat,
-              title: buildFullName(other.firstName, other.lastName),
-              username: `@${other.username}`,
-              bio: other.bio,
-              avatarUrl: other.avatarUrl,
-              avatarColor: other.avatarColor,
-              online: true,
-              lastSeenText: 'в сети',
-            };
-          }
+      .map((chat) => this.decorateChatForUser(chat, userId, onlineUserIds));
+  }
+
+  public markChatMessagesRead(
+    chatId: string,
+    readerId: string,
+    emitReadReceipt = true,
+  ): { changedMessageIds: string[]; readAt: string } {
+    const readAt = new Date().toISOString();
+    const list = this.db.messagesByChat[chatId] ?? [];
+    const changedMessageIds: string[] = [];
+
+    for (const msg of list) {
+      if (msg.senderId === readerId) continue;
+      const alreadyReadByUser = msg.readBy?.includes(readerId) ?? false;
+      if (msg.status !== 'read' || !alreadyReadByUser) {
+        const nextReadBy = alreadyReadByUser
+          ? msg.readBy ?? [readerId]
+          : [...(msg.readBy ?? []), readerId];
+        msg.readBy = nextReadBy;
+        if (emitReadReceipt && msg.status !== 'read') {
+          msg.status = 'read';
+          changedMessageIds.push(msg.id);
         }
-        return chat;
-      });
+      }
+    }
+
+    if (changedMessageIds.length > 0) {
+      this.scheduleLocalPersist();
+      if (this.supabase) {
+        void this.supabase
+          .from('tiligram_messages')
+          .update({ status: 'read' })
+          .in('id', changedMessageIds);
+      }
+    }
+
+    return { changedMessageIds, readAt };
   }
 
   public getMessagesForUser(userId: string): Record<string, ChatMessage[]> {

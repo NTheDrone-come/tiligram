@@ -337,9 +337,15 @@ export function MessageBubble({
               <span>{formatMessageTime(message.createdAt)}</span>
               {isOwn &&
                 (message.status === 'read' ? (
-                  <CheckCheck className="w-3.5 h-3.5" />
+                  <CheckCheck
+                    aria-label="Прочитано"
+                    className="w-3.5 h-3.5 text-[#54C4FF] drop-shadow-[0_0_4px_rgba(84,196,255,0.65)] transition-colors"
+                  />
                 ) : (
-                  <Check className="w-3.5 h-3.5" />
+                  <Check
+                    aria-label="Отправлено"
+                    className="w-3.5 h-3.5 text-white/65 transition-colors"
+                  />
                 ))}
             </div>
           </div>
@@ -521,12 +527,12 @@ export function MessageBubble({
                 (message.status === 'read' ? (
                   <CheckCheck
                     aria-label="Прочитано"
-                    className="w-3.5 h-3.5 text-[#4FAE4E] dark:text-[#7CC0FA]"
+                    className="w-3.5 h-3.5 text-[#1D9BF0] dark:text-[#54C4FF] drop-shadow-[0_0_5px_rgba(84,196,255,0.5)] transition-colors"
                   />
                 ) : (
                   <Check
                     aria-label="Отправлено"
-                    className="w-3.5 h-3.5 text-[#4FAE4E] dark:text-[#7CC0FA]"
+                    className="w-3.5 h-3.5 text-[#4F9A50]/60 dark:text-[#8FBBE4]/55 transition-colors"
                   />
                 ))}
             </div>

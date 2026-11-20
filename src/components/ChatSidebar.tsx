@@ -21,11 +21,17 @@ import {
   getUnreadCountByFolder,
   searchMessagesGlobally,
 } from '../utils/chatLogic';
-import type { ChatFolder, ChatMessage, ChatThread } from '../types/telegram';
+import type {
+  ChatFolder,
+  ChatMessage,
+  ChatThread,
+  TypingState,
+} from '../types/telegram';
 
 interface ChatSidebarProps {
   chats: ChatThread[];
   messagesByChat: Record<string, ChatMessage[]>;
+  typingByChat: Record<string, TypingState | undefined>;
   currentUserId: string;
   activeChatId: string | null;
   folder: ChatFolder;
@@ -49,6 +55,7 @@ const FOLDERS: Array<{ id: ChatFolder; label: string }> = [
 export function ChatSidebar({
   chats,
   messagesByChat,
+  typingByChat,
   currentUserId,
   activeChatId,
   folder,
@@ -74,13 +81,13 @@ export function ChatSidebar({
       className="relative flex flex-col h-full w-full md:w-[356px] lg:w-[388px] shrink-0 bg-white dark:bg-[#17212B] border-r border-slate-200/90 dark:border-[#0E1621]"
     >
       {/* Top Bar: Menu + Search */}
-      <div className="flex items-center gap-2.5 px-3 pt-2.5 pb-2 shrink-0">
+      <div className="flex items-center gap-2.5 px-3 pt-2.5 pb-2 pt-safe shrink-0">
         {showArchived ? (
           <button
             type="button"
             onClick={() => onToggleArchiveView(false)}
             aria-label="Назад ко всем чатам"
-            className="min-w-[40px] min-h-[40px] rounded-full flex items-center justify-center text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-[#232E3C] transition-colors cursor-pointer"
+            className="min-w-[44px] min-h-[44px] rounded-full flex items-center justify-center text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-[#232E3C] transition-colors cursor-pointer"
           >
             <ArrowLeft className="w-5 h-5" />
           </button>
@@ -89,7 +96,7 @@ export function ChatSidebar({
             type="button"
             onClick={onOpenDrawer}
             aria-label="Открыть меню навигации"
-            className="min-w-[40px] min-h-[40px] rounded-full flex items-center justify-center text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-[#232E3C] transition-colors cursor-pointer"
+            className="min-w-[44px] min-h-[44px] rounded-full flex items-center justify-center text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-[#232E3C] transition-colors cursor-pointer"
           >
             <Menu className="w-5 h-5" />
           </button>
@@ -106,7 +113,7 @@ export function ChatSidebar({
             onChange={(e) => onChangeSearch(e.target.value)}
             placeholder={showArchived ? 'Поиск в архиве' : 'Поиск'}
             aria-label="Поиск чатов и сообщений"
-            className="w-full h-10 pl-10 pr-9 rounded-full bg-[#F1F4F7] dark:bg-[#242F3D] text-sm text-slate-900 dark:text-slate-100 placeholder:text-slate-500 dark:placeholder:text-slate-400 border border-transparent focus:border-[#3390EC] focus:bg-white dark:focus:bg-[#17212B] focus:outline-none transition-colors"
+            className="w-full h-11 sm:h-10 pl-10 pr-9 rounded-full bg-[#F1F4F7] dark:bg-[#242F3D] text-base sm:text-sm text-slate-900 dark:text-slate-100 placeholder:text-slate-500 dark:placeholder:text-slate-400 border border-transparent focus:border-[#3390EC] focus:bg-white dark:focus:bg-[#17212B] focus:outline-none transition-colors"
           />
           {searchQuery && (
             <button
@@ -135,7 +142,7 @@ export function ChatSidebar({
         <div
           role="tablist"
           aria-label="Папки чатов"
-          className="flex items-center px-2 border-b border-slate-200/80 dark:border-[#0E1621] shrink-0 overflow-x-auto"
+          className="flex items-center px-2 border-b border-slate-200/80 dark:border-[#0E1621] shrink-0 overflow-x-auto no-scrollbar"
         >
           {FOLDERS.map((tab) => {
             const isSelected = folder === tab.id;
@@ -147,7 +154,7 @@ export function ChatSidebar({
                 role="tab"
                 aria-selected={isSelected}
                 onClick={() => onChangeFolder(tab.id)}
-                className={`relative flex-1 min-w-fit px-3 py-2.5 text-[13px] font-semibold transition-colors whitespace-nowrap shrink-0 flex items-center justify-center gap-1.5 cursor-pointer ${
+                className={`relative flex-1 min-w-fit min-h-[44px] px-3 py-2.5 text-[13px] font-semibold transition-colors whitespace-nowrap shrink-0 flex items-center justify-center gap-1.5 cursor-pointer ${
                   isSelected
                     ? 'text-[#3390EC] dark:text-[#6AB3F3]'
                     : 'text-slate-500 dark:text-slate-400 hover:text-slate-800 dark:hover:text-slate-200'
@@ -226,6 +233,7 @@ export function ChatSidebar({
               const lastMsg = msgs[msgs.length - 1];
               const isOwnLast = lastMsg?.senderId === currentUserId;
               const previewText = getMessagePreviewText(lastMsg);
+              const typing = typingByChat[chat.id];
 
               return (
                 <button
@@ -293,16 +301,18 @@ export function ChatSidebar({
                         {isOwnLast && lastMsg && (
                           lastMsg.status === 'read' ? (
                             <CheckCheck
-                              aria-hidden="true"
-                              className={`w-4 h-4 ${
-                                isActive ? 'text-white/90' : 'text-[#4FAE4E] dark:text-[#6AB3F3]'
+                              aria-label="Прочитано"
+                              className={`w-4 h-4 transition-colors ${
+                                isActive
+                                  ? 'text-[#A6E1FF] drop-shadow-[0_0_4px_rgba(166,225,255,0.6)]'
+                                  : 'text-[#1D9BF0] dark:text-[#54C4FF]'
                               }`}
                             />
                           ) : (
                             <Check
-                              aria-hidden="true"
-                              className={`w-4 h-4 ${
-                                isActive ? 'text-white/80' : 'text-slate-400'
+                              aria-label="Отправлено"
+                              className={`w-4 h-4 transition-colors ${
+                                isActive ? 'text-white/60' : 'text-slate-400/75 dark:text-slate-500'
                               }`}
                             />
                           )
@@ -318,31 +328,52 @@ export function ChatSidebar({
                     </div>
 
                     <div className="flex items-center justify-between gap-2 mt-0.5">
-                      <p
-                        className={`text-[13.5px] truncate ${
-                          isActive ? 'text-white/90' : 'text-slate-500 dark:text-slate-400'
-                        }`}
-                      >
-                        {chat.type === 'group' && lastMsg && (
-                          <span
-                            className={`font-medium mr-1 ${
-                              isActive ? 'text-white' : 'text-slate-700 dark:text-slate-200'
-                            }`}
-                          >
-                            {isOwnLast ? 'Вы:' : `${lastMsg.senderName.split(' ')[0]}:`}
+                      {typing ? (
+                        <p
+                          className={`text-[13.5px] font-medium truncate flex items-center gap-1 ${
+                            isActive
+                              ? 'text-white'
+                              : 'text-[#3390EC] dark:text-[#6AB3F3]'
+                          }`}
+                        >
+                          <span className="inline-flex items-center gap-0.5 mr-0.5">
+                            <span className="w-1 h-1 rounded-full bg-current animate-bounce [animation-delay:-0.25s]" />
+                            <span className="w-1 h-1 rounded-full bg-current animate-bounce [animation-delay:-0.12s]" />
+                            <span className="w-1 h-1 rounded-full bg-current animate-bounce" />
                           </span>
-                        )}
-                        {chat.type === 'private' && isOwnLast && lastMsg && (
-                          <span
-                            className={`font-medium mr-1 ${
-                              isActive ? 'text-white' : 'text-[#3390EC] dark:text-[#6AB3F3]'
-                            }`}
-                          >
-                            Вы:
+                          <span className="truncate">
+                            {chat.type === 'group'
+                              ? `${typing.userName.split(' ')[0]} печатает...`
+                              : 'печатает...'}
                           </span>
-                        )}
-                        {previewText}
-                      </p>
+                        </p>
+                      ) : (
+                        <p
+                          className={`text-[13.5px] truncate ${
+                            isActive ? 'text-white/90' : 'text-slate-500 dark:text-slate-400'
+                          }`}
+                        >
+                          {chat.type === 'group' && lastMsg && (
+                            <span
+                              className={`font-medium mr-1 ${
+                                isActive ? 'text-white' : 'text-slate-700 dark:text-slate-200'
+                              }`}
+                            >
+                              {isOwnLast ? 'Вы:' : `${lastMsg.senderName.split(' ')[0]}:`}
+                            </span>
+                          )}
+                          {chat.type === 'private' && isOwnLast && lastMsg && (
+                            <span
+                              className={`font-medium mr-1 ${
+                                isActive ? 'text-white' : 'text-[#3390EC] dark:text-[#6AB3F3]'
+                              }`}
+                            >
+                              Вы:
+                            </span>
+                          )}
+                          {previewText}
+                        </p>
+                      )}
 
                       <div className="flex items-center gap-1.5 shrink-0">
                         {chat.unreadCount > 0 ? (
@@ -420,7 +451,7 @@ export function ChatSidebar({
         type="button"
         onClick={onOpenCreateModal}
         aria-label="Найти пользователя, создать группу или канал"
-        className="absolute bottom-5 right-5 w-13 h-13 rounded-full active:scale-95 text-white shadow-lg flex items-center justify-center transition-all cursor-pointer focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#3390EC]"
+        className="absolute bottom-[max(1.25rem,env(safe-area-inset-bottom))] right-5 w-14 h-14 sm:w-13 sm:h-13 rounded-full active:scale-95 text-white shadow-lg flex items-center justify-center transition-all cursor-pointer focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#3390EC]"
         style={{ backgroundColor: 'var(--tg-accent)' }}
       >
         <Pencil className="w-5 h-5" />

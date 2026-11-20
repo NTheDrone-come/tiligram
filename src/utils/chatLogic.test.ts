@@ -2,8 +2,12 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
   applyIdempotentMessageCreate,
+  computeChatProfileStats,
   extractSharedItems,
   filterChats,
+  findCommonGroups,
+  formatBirthdayWithAge,
+  formatMemberSince,
   getUnreadCountByFolder,
   searchMessagesGlobally,
   searchMessagesInChat,
@@ -219,4 +223,98 @@ test('search and shared items extraction work accurately', () => {
   const shared = extractSharedItems(msgs);
   assert.equal(shared.files.length, 1);
   assert.equal(shared.links.length, 1);
+});
+
+test('formatBirthdayWithAge formats ISO and RU dates with proper Russian age pluralization', () => {
+  const refNow = new Date(2026, 10, 20); // 20 Nov 2026
+  const iso = formatBirthdayWithAge('1999-05-15', refNow);
+  assert.ok(iso && iso.includes('27 лет'), `Unexpected: ${iso}`);
+
+  const ru = formatBirthdayWithAge('01.02.2005', refNow);
+  assert.ok(ru && ru.includes('21 год'), `Unexpected: ${ru}`);
+
+  const age24 = formatBirthdayWithAge('2002-01-10', refNow);
+  assert.ok(age24 && age24.includes('24 года'), `Unexpected: ${age24}`);
+
+  assert.equal(formatBirthdayWithAge(''), null);
+  assert.equal(formatBirthdayWithAge('Весна'), 'Весна');
+});
+
+test('formatMemberSince formats valid ISO dates and returns null on invalid input', () => {
+  const formatted = formatMemberSince('2026-11-20T10:00:00.000Z');
+  assert.ok(formatted && formatted.includes('2026'));
+  assert.equal(formatMemberSince('not-a-date'), null);
+  assert.equal(formatMemberSince(undefined), null);
+});
+
+test('computeChatProfileStats aggregates own/peer counts, media, files, voice, stickers, links', () => {
+  const msgs: ChatMessage[] = [
+    {
+      id: 'm1',
+      chatId: 'c1',
+      senderId: 'me',
+      senderName: 'Я',
+      kind: 'text',
+      text: 'Привет https://example.com',
+      createdAt: '2026-11-01T10:00:00.000Z',
+      status: 'read',
+      reactions: [],
+    },
+    {
+      id: 'm2',
+      chatId: 'c1',
+      senderId: 'peer',
+      senderName: 'Собеседник',
+      kind: 'voice',
+      text: '',
+      createdAt: '2026-11-02T10:00:00.000Z',
+      status: 'read',
+      reactions: [],
+      attachment: { url: '', name: 'Голосовое', durationSec: 12 },
+    },
+    {
+      id: 'm3',
+      chatId: 'c1',
+      senderId: 'me',
+      senderName: 'Я',
+      kind: 'sticker',
+      text: '',
+      createdAt: '2026-11-03T10:00:00.000Z',
+      status: 'read',
+      reactions: [],
+    },
+  ];
+  const stats = computeChatProfileStats(msgs, 'me');
+  assert.equal(stats.totalMessages, 3);
+  assert.equal(stats.ownMessages, 2);
+  assert.equal(stats.peerMessages, 1);
+  assert.equal(stats.voiceCount, 1);
+  assert.equal(stats.stickersCount, 1);
+  assert.equal(stats.linksCount, 1);
+  assert.equal(stats.firstMessageAt, '2026-11-01T10:00:00.000Z');
+  assert.equal(stats.lastMessageAt, '2026-11-03T10:00:00.000Z');
+});
+
+test('findCommonGroups returns only group chats containing the peer user', () => {
+  const chatsWithMembers: ChatThread[] = [
+    ...baseChats,
+    {
+      id: 'g-shared',
+      type: 'group',
+      title: 'Общая группа',
+      avatarColor: '#3390EC',
+      pinned: false,
+      muted: false,
+      archived: false,
+      unreadCount: 0,
+      participantIds: ['me', 'u-peer'],
+      lastMessageAt: '2026-06-01T12:00:00.000Z',
+    },
+  ];
+  const found = findCommonGroups(chatsWithMembers, 'u-peer');
+  assert.deepEqual(
+    found.map((g) => g.id),
+    ['g-shared'],
+  );
+  assert.equal(findCommonGroups(chatsWithMembers, undefined).length, 0);
 });

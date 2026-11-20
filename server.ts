@@ -4,7 +4,7 @@ import fs from 'fs';
 import http from 'http';
 import path from 'path';
 import { WebSocketServer, WebSocket } from 'ws';
-import { TiligramStorage } from './src/server/storage.ts';
+import { TiligramStorage, type ClusterSyncEvent } from './src/server/storage.ts';
 import {
   applyIdempotentMessageCreate,
   buildFullName,
@@ -22,6 +22,7 @@ import {
 import type {
   ActiveCallRoom,
   CallParticipant,
+  ChatMember,
   ChatMessage,
   ChatThread,
   ClientWsEvent,
@@ -40,10 +41,27 @@ setInterval(() => {
 interface AuthedSocket {
   ws: WebSocket;
   userId: string;
+  isAlive: boolean;
 }
 
 const activeClients = new Map<WebSocket, AuthedSocket>();
+const remoteOnlineUsers = new Set<string>();
 const activeCalls = new Map<string, ActiveCallRoom>();
+
+function getOnlineUserIds(): Set<string> {
+  const ids = new Set<string>(remoteOnlineUsers);
+  for (const client of activeClients.values()) {
+    ids.add(client.userId);
+  }
+  return ids;
+}
+
+function hasLocalConnectionForUser(userId: string): boolean {
+  for (const client of activeClients.values()) {
+    if (client.userId === userId) return true;
+  }
+  return false;
+}
 
 function getAppVersion(): string {
   try {
@@ -182,6 +200,142 @@ function getTargetUserIdsForChat(chat: ChatThread): Set<string> | null {
   return null;
 }
 
+function broadcastPersonalizedChatEvent(
+  chat: ChatThread,
+  buildEvent: (decoratedChat: ChatThread, recipientUserId: string) => ServerWsEvent,
+  exclude?: WebSocket,
+): void {
+  const targets = getTargetUserIdsForChat(chat);
+  const onlineIds = getOnlineUserIds();
+  for (const [ws, client] of activeClients) {
+    if (ws === exclude || ws.readyState !== WebSocket.OPEN) continue;
+    if (targets && !targets.has(client.userId)) continue;
+    const decorated = storage.decorateChatForUser(chat, client.userId, onlineIds);
+    sendWs(ws, buildEvent(decorated, client.userId));
+  }
+}
+
+function broadcastPresenceForUser(userId: string, publishCluster = true): void {
+  const acc = storage.getAccountById(userId);
+  if (!acc) return;
+  const onlineIds = getOnlineUserIds();
+  const presence = storage.getPresenceForAccount(acc, onlineIds);
+  broadcastAll({
+    type: 'presence:update',
+    payload: {
+      userId,
+      online: presence.online,
+      lastSeenAt: presence.lastSeenAt,
+      lastSeenText: presence.lastSeenText,
+    },
+  });
+  if (publishCluster) {
+    storage.publishClusterEvent({
+      type: 'presence:update',
+      userId,
+      online: hasLocalConnectionForUser(userId),
+      lastSeenAt: acc.lastSeenAt,
+    });
+  }
+}
+
+function handleRemoteClusterEvent(evt: ClusterSyncEvent): void {
+  const onlineIds = getOnlineUserIds();
+  switch (evt.type) {
+    case 'account:upsert': {
+      const summary = storage.toPublicUserSummary(evt.account, onlineIds);
+      broadcastAll({ type: 'directory:updated', payload: { user: summary } });
+      broadcastAll({ type: 'user:profile_changed', payload: { user: summary } });
+      break;
+    }
+    case 'chat:upsert': {
+      broadcastPersonalizedChatEvent(evt.chat, (decorated) => ({
+        type: 'chat:created',
+        payload: {
+          chat: decorated,
+          messages: evt.messages ?? storage.getChatMessages(evt.chat.id),
+        },
+      }));
+      break;
+    }
+    case 'message:upsert': {
+      broadcastPersonalizedChatEvent(evt.chat, (decorated) => ({
+        type: 'message:created',
+        payload: { message: evt.message, chat: decorated },
+      }));
+      break;
+    }
+    case 'message:delete': {
+      broadcastPersonalizedChatEvent(evt.chat, (decorated) => ({
+        type: 'message:deleted',
+        payload: { chatId: evt.chatId, messageId: evt.messageId, chat: decorated },
+      }));
+      break;
+    }
+    case 'chat:clear': {
+      broadcastPersonalizedChatEvent(evt.chat, (decorated) => ({
+        type: 'chat:cleared',
+        payload: { chatId: evt.chatId, chat: decorated },
+      }));
+      break;
+    }
+    case 'messages:read': {
+      const chat = storage.getChatById(evt.chatId);
+      const targets = chat ? getTargetUserIdsForChat(chat) : null;
+      const readEvt: ServerWsEvent = {
+        type: 'messages:read',
+        payload: {
+          chatId: evt.chatId,
+          messageIds: evt.messageIds,
+          readerId: evt.readerId,
+          readAt: evt.readAt,
+        },
+      };
+      if (targets) broadcastToUsers(targets, readEvt);
+      else broadcastAll(readEvt);
+      break;
+    }
+    case 'typing:update': {
+      const chat = storage.getChatById(evt.chatId);
+      if (!chat) break;
+      const targets = getTargetUserIdsForChat(chat);
+      const typingEvt: ServerWsEvent = {
+        type: 'typing:update',
+        payload: {
+          chatId: evt.chatId,
+          userId: evt.userId,
+          userName: evt.userName,
+          isTyping: evt.isTyping,
+        },
+      };
+      if (targets) {
+        const others = new Set(Array.from(targets).filter((id) => id !== evt.userId));
+        broadcastToUsers(others, typingEvt);
+      } else {
+        for (const [ws, client] of activeClients) {
+          if (client.userId !== evt.userId && ws.readyState === WebSocket.OPEN) {
+            sendWs(ws, typingEvt);
+          }
+        }
+      }
+      break;
+    }
+    case 'presence:update': {
+      if (evt.online) remoteOnlineUsers.add(evt.userId);
+      else remoteOnlineUsers.delete(evt.userId);
+      broadcastPresenceForUser(evt.userId, false);
+      break;
+    }
+    case 'stickers:updated': {
+      broadcastAll({
+        type: 'stickers:updated',
+        payload: { stickerPacks: evt.stickerPacks },
+      });
+      break;
+    }
+  }
+}
+
 function extractBearerUserId(req: express.Request): string | null {
   const header = req.headers.authorization;
   if (!header || !header.startsWith('Bearer ')) return null;
@@ -190,6 +344,9 @@ function extractBearerUserId(req: express.Request): string | null {
 }
 
 async function startServer() {
+  await storage.ready;
+  storage.startClusterSync(handleRemoteClusterEvent);
+
   const app = express();
   app.use(express.json({ limit: '40mb' }));
 
@@ -274,8 +431,7 @@ async function startServer() {
         return;
       }
 
-      if (releaseRes.status === 404) {
-        // Repo may exist without published Releases yet — verify repo existence
+      if (releaseRes.status === 404 || releaseRes.status === 401 || releaseRes.status === 403) {
         const repoRes = await fetch(`https://api.github.com/repos/${repo}`, {
           headers,
         });
@@ -294,13 +450,36 @@ async function startServer() {
           });
           return;
         }
+        if (repoRes.status === 401) {
+          res.json({
+            status: 'error',
+            currentVersion,
+            updateAvailable: false,
+            repo,
+            error:
+              'GITHUB_TOKEN недействителен или истёк (401 Bad credentials). Проверьте токен в Secrets.',
+          });
+          return;
+        }
+        if (repoRes.status === 403) {
+          res.json({
+            status: 'error',
+            currentVersion,
+            updateAvailable: false,
+            repo,
+            error:
+              'GITHUB_TOKEN не имеет прав доступа к репозиторию (403 Forbidden). Выдайте права repo или Contents: Read-only.',
+          });
+          return;
+        }
         res.json({
           status: 'error',
           currentVersion,
           updateAvailable: false,
           repo,
-          error:
-            'Репозиторий не найден или приватный (для приватного добавьте GITHUB_TOKEN в Secrets)',
+          error: ghToken
+            ? `Репозиторий "${repo}" не найден (404) даже с GITHUB_TOKEN — проверьте точное название репозитория и что токену выдан доступ к этому репозиторию (Contents: Read-only / repo).`
+            : `Репозиторий "${repo}" не найден или приватный, а GITHUB_TOKEN сейчас не задан в Secrets.`,
         });
         return;
       }
@@ -327,7 +506,8 @@ async function startServer() {
   });
 
   // --- Auth Endpoints ---
-  app.get('/api/auth/check-username', (req, res) => {
+  app.get('/api/auth/check-username', async (req, res) => {
+    await storage.refreshAccountsFromSupabase();
     const raw = String(req.query.username ?? '');
     const excludeUserId = req.query.excludeUserId
       ? String(req.query.excludeUserId)
@@ -351,7 +531,8 @@ async function startServer() {
     });
   });
 
-  app.post('/api/auth/register', (req, res) => {
+  app.post('/api/auth/register', async (req, res) => {
+    await storage.refreshAccountsFromSupabase(true);
     const body = req.body ?? {};
     const check = validateRegistrationInput({
       firstName: String(body.firstName ?? ''),
@@ -374,12 +555,17 @@ async function startServer() {
       return;
     }
 
-    const { account } = storage.registerAccount({
+    const { account, savedChat } = storage.registerAccount({
       firstName: check.firstName,
       lastName: check.lastName,
       username: check.username,
       password: String(body.password),
     });
+
+    const summary = storage.toPublicUserSummary(account, getOnlineUserIds());
+    broadcastAll({ type: 'directory:updated', payload: { user: summary } });
+    storage.publishClusterEvent({ type: 'account:upsert', account });
+    storage.publishClusterEvent({ type: 'chat:upsert', chat: savedChat, messages: [] });
 
     const token = storage.signToken(account.id);
     res.status(201).json({
@@ -389,10 +575,14 @@ async function startServer() {
     });
   });
 
-  app.post('/api/auth/login', (req, res) => {
+  app.post('/api/auth/login', async (req, res) => {
     const rawUsername = String(req.body?.username ?? '');
     const password = String(req.body?.password ?? '');
-    const acc = storage.getAccountByUsername(rawUsername);
+    let acc = storage.getAccountByUsername(rawUsername);
+    if (!acc) {
+      await storage.refreshAccountsFromSupabase(true);
+      acc = storage.getAccountByUsername(rawUsername);
+    }
 
     if (!acc || !storage.verifyPassword(password, acc.passwordHash, acc.passwordSalt)) {
       res.status(401).json({ error: 'Неверный юзернейм или пароль' });
@@ -407,13 +597,17 @@ async function startServer() {
     });
   });
 
-  app.get('/api/auth/me', (req, res) => {
+  app.get('/api/auth/me', async (req, res) => {
     const userId = extractBearerUserId(req);
     if (!userId) {
       res.status(401).json({ error: 'Неавторизован' });
       return;
     }
-    const acc = storage.getAccountById(userId);
+    let acc = storage.getAccountById(userId);
+    if (!acc) {
+      await storage.refreshAccountsFromSupabase(true);
+      acc = storage.getAccountById(userId);
+    }
     if (!acc) {
       res.status(401).json({ error: 'Аккаунт не найден' });
       return;
@@ -445,14 +639,15 @@ async function startServer() {
   });
 
   // --- Users Directory Search ---
-  app.get('/api/users/search', (req, res) => {
+  app.get('/api/users/search', async (req, res) => {
     const userId = extractBearerUserId(req);
     if (!userId) {
       res.status(401).json({ error: 'Требуется вход' });
       return;
     }
+    await storage.refreshAccountsFromSupabase();
     const q = String(req.query.q ?? '');
-    const users = storage.searchAccounts(q, userId);
+    const users = storage.searchAccounts(q, userId, getOnlineUserIds());
     res.json({ users });
   });
 
@@ -651,10 +846,39 @@ async function startServer() {
   const server = http.createServer(app);
   const wss = new WebSocketServer({ server, path: '/ws' });
 
+  // WebSocket keepalive ping/pong every 25s so Cloud Run / proxies never drop idle sockets
+  const heartbeatInterval = setInterval(() => {
+    for (const [ws, client] of activeClients) {
+      if (!client.isAlive) {
+        ws.terminate();
+        continue;
+      }
+      client.isAlive = false;
+      try {
+        ws.ping();
+      } catch {
+        ws.terminate();
+      }
+    }
+  }, 25_000);
+  wss.on('close', () => clearInterval(heartbeatInterval));
+
   wss.on('connection', (ws) => {
+    ws.on('pong', () => {
+      const client = activeClients.get(ws);
+      if (client) client.isAlive = true;
+    });
+
     ws.on('message', (raw) => {
       try {
         const event = JSON.parse(raw.toString()) as ClientWsEvent;
+
+        if (event.type === 'client:ping') {
+          const client = activeClients.get(ws);
+          if (client) client.isAlive = true;
+          sendWs(ws, { type: 'server:pong', ts: event.ts });
+          return;
+        }
 
         if (event.type === 'client:auth') {
           const userId = storage.verifyToken(event.token);
@@ -668,14 +892,16 @@ async function startServer() {
             return;
           }
 
-          activeClients.set(ws, { ws, userId });
+          activeClients.set(ws, { ws, userId, isAlive: true });
+          storage.touchAccountLastSeen(userId);
+          const onlineIds = getOnlineUserIds();
 
           sendWs(ws, {
             type: 'sync:init',
             payload: {
               currentUser: storage.toUserProfile(acc, true),
               settings: acc.settings,
-              chats: storage.getChatsForUser(userId),
+              chats: storage.getChatsForUser(userId, onlineIds),
               messagesByChat: storage.getMessagesForUser(userId),
               stickerPacks: storage.getStickerPacks(),
               activeCalls: getActiveCallsForUser(userId),
@@ -683,6 +909,7 @@ async function startServer() {
             },
           });
 
+          broadcastPresenceForUser(userId, true);
           broadcastAll({
             type: 'presence:count',
             payload: { onlineClientCount: activeClients.size },
@@ -695,6 +922,7 @@ async function startServer() {
           sendWs(ws, { type: 'auth:error', payload: { message: 'Требуется вход' } });
           return;
         }
+        authed.isAlive = true;
         const me = storage.getAccountById(authed.userId);
         if (!me) return;
 
@@ -714,7 +942,8 @@ async function startServer() {
               kind: p.kind,
               text: p.text.trim(),
               createdAt: nowIso,
-              status: 'read',
+              status: chat.type === 'saved' ? 'read' : 'sent',
+              readBy: [me.id],
               replyToId: p.replyToId,
               forwardedFrom: p.forwardedFrom,
               reactions: [],
@@ -729,14 +958,12 @@ async function startServer() {
             chat.lastMessageAt = nowIso;
             chat.archived = false;
             storage.saveMessage(message, chat);
+            storage.publishClusterEvent({ type: 'message:upsert', message, chat });
 
-            const targets = getTargetUserIdsForChat(chat);
-            const createdEvt: ServerWsEvent = {
+            broadcastPersonalizedChatEvent(chat, (decoratedChat) => ({
               type: 'message:created',
-              payload: { message, chat },
-            };
-            if (targets) broadcastToUsers(targets, createdEvt);
-            else broadcastAll(createdEvt);
+              payload: { message, chat: decoratedChat },
+            }));
             break;
           }
 
@@ -750,6 +977,7 @@ async function startServer() {
             msg.text = text.trim();
             msg.editedAt = new Date().toISOString();
             storage.saveMessage(msg, chat);
+            storage.publishClusterEvent({ type: 'message:upsert', message: msg, chat });
 
             const targets = getTargetUserIdsForChat(chat);
             const evt: ServerWsEvent = { type: 'message:updated', payload: { message: msg } };
@@ -771,14 +999,17 @@ async function startServer() {
               chat.pinnedMessageId = null;
             }
             storage.deleteMessage(chatId, messageId, chat);
+            storage.publishClusterEvent({
+              type: 'message:delete',
+              chatId,
+              messageId,
+              chat,
+            });
 
-            const targets = getTargetUserIdsForChat(chat);
-            const evt: ServerWsEvent = {
+            broadcastPersonalizedChatEvent(chat, (decoratedChat) => ({
               type: 'message:deleted',
-              payload: { chatId, messageId, chat },
-            };
-            if (targets) broadcastToUsers(targets, evt);
-            else broadcastAll(evt);
+              payload: { chatId, messageId, chat: decoratedChat },
+            }));
             break;
           }
 
@@ -791,6 +1022,7 @@ async function startServer() {
 
             msg.reactions = toggleReactionOnList(msg.reactions, emoji, me.id);
             storage.saveMessage(msg, chat);
+            storage.publishClusterEvent({ type: 'message:upsert', message: msg, chat });
 
             const targets = getTargetUserIdsForChat(chat);
             const evt: ServerWsEvent = { type: 'message:updated', payload: { message: msg } };
@@ -806,10 +1038,10 @@ async function startServer() {
             chat.pinnedMessageId = messageId;
             storage.upsertChat(chat);
 
-            const targets = getTargetUserIdsForChat(chat);
-            const evt: ServerWsEvent = { type: 'chat:updated', payload: { chat } };
-            if (targets) broadcastToUsers(targets, evt);
-            else broadcastAll(evt);
+            broadcastPersonalizedChatEvent(chat, (decoratedChat) => ({
+              type: 'chat:updated',
+              payload: { chat: decoratedChat },
+            }));
             break;
           }
 
@@ -817,9 +1049,48 @@ async function startServer() {
             const { chatId } = event.payload;
             const chat = storage.getChatById(chatId);
             if (!chat) break;
-            chat.unreadCount = 0;
-            storage.upsertChat(chat);
-            sendWs(ws, { type: 'chat:updated', payload: { chat } });
+
+            const emitReadReceipt = me.settings?.privacy?.readReceipts !== false;
+            const { changedMessageIds, readAt } = storage.markChatMessagesRead(
+              chatId,
+              me.id,
+              emitReadReceipt,
+            );
+
+            // Update reader's own unread count across all their tabs
+            const decoratedForReader = storage.decorateChatForUser(
+              chat,
+              me.id,
+              getOnlineUserIds(),
+            );
+            broadcastToUsers(new Set([me.id]), {
+              type: 'chat:updated',
+              payload: { chat: decoratedForReader },
+            });
+
+            // Immediately highlight checkmarks for the sender(s) in real time
+            if (changedMessageIds.length > 0) {
+              const readEvt: ServerWsEvent = {
+                type: 'messages:read',
+                payload: {
+                  chatId,
+                  messageIds: changedMessageIds,
+                  readerId: me.id,
+                  readAt,
+                },
+              };
+              const targets = getTargetUserIdsForChat(chat);
+              if (targets) broadcastToUsers(targets, readEvt);
+              else broadcastAll(readEvt);
+
+              storage.publishClusterEvent({
+                type: 'messages:read',
+                chatId,
+                messageIds: changedMessageIds,
+                readerId: me.id,
+                readAt,
+              });
+            }
             break;
           }
 
@@ -831,7 +1102,15 @@ async function startServer() {
             if (typeof muted === 'boolean') chat.muted = muted;
             if (typeof archived === 'boolean') chat.archived = archived;
             storage.upsertChat(chat);
-            sendWs(ws, { type: 'chat:updated', payload: { chat } });
+            const decorated = storage.decorateChatForUser(
+              chat,
+              me.id,
+              getOnlineUserIds(),
+            );
+            broadcastToUsers(new Set([me.id]), {
+              type: 'chat:updated',
+              payload: { chat: decorated },
+            });
             break;
           }
 
@@ -842,26 +1121,25 @@ async function startServer() {
             chat.pinnedMessageId = null;
             chat.unreadCount = 0;
             storage.clearChatMessages(chatId, chat);
+            storage.publishClusterEvent({ type: 'chat:clear', chatId, chat });
 
-            const targets = getTargetUserIdsForChat(chat);
-            const evt: ServerWsEvent = {
+            broadcastPersonalizedChatEvent(chat, (decoratedChat) => ({
               type: 'chat:cleared',
-              payload: { chatId, chat },
-            };
-            if (targets) broadcastToUsers(targets, evt);
-            else broadcastAll(evt);
+              payload: { chatId, chat: decoratedChat },
+            }));
             break;
           }
 
           case 'chat:create': {
             const p = event.payload;
+            const onlineIds = getOnlineUserIds();
             if (p.type === 'private' && p.targetUserId) {
               const existing = storage.findExistingDirectChat(me.id, p.targetUserId);
               if (existing) {
                 sendWs(ws, {
                   type: 'chat:created',
                   payload: {
-                    chat: existing,
+                    chat: storage.decorateChatForUser(existing, me.id, onlineIds),
                     messages: storage.getChatMessages(existing.id),
                   },
                 });
@@ -873,6 +1151,63 @@ async function startServer() {
             const targetAcc = p.targetUserId
               ? storage.getAccountById(p.targetUserId)
               : undefined;
+
+            const participantIds = targetAcc ? [me.id, targetAcc.id] : [me.id];
+            const groupMembers: ChatMember[] | undefined =
+              p.type === 'group'
+                ? [
+                    {
+                      id: me.id,
+                      name: buildFullName(me.firstName, me.lastName),
+                      username: `@${me.username}`,
+                      role: 'owner',
+                      avatarUrl: me.avatarUrl,
+                      avatarColor: me.avatarColor,
+                      online: true,
+                      lastSeenAt: me.lastSeenAt,
+                      lastSeenText: 'в сети',
+                    },
+                  ]
+                : undefined;
+
+            if (p.type === 'group' && groupMembers && p.memberNames) {
+              for (let i = 0; i < p.memberNames.length; i++) {
+                const rawName = p.memberNames[i].trim();
+                if (!rawName) continue;
+                const matchedAcc = storage.getAccountByUsername(rawName);
+                if (matchedAcc && matchedAcc.id !== me.id) {
+                  if (!participantIds.includes(matchedAcc.id)) {
+                    participantIds.push(matchedAcc.id);
+                    const presence = storage.getPresenceForAccount(matchedAcc, onlineIds);
+                    groupMembers.push({
+                      id: matchedAcc.id,
+                      name: buildFullName(matchedAcc.firstName, matchedAcc.lastName),
+                      username: `@${matchedAcc.username}`,
+                      role: 'member',
+                      avatarUrl: matchedAcc.avatarUrl,
+                      avatarColor: matchedAcc.avatarColor,
+                      online: presence.online,
+                      lastSeenAt: presence.lastSeenAt,
+                      lastSeenText: presence.lastSeenText,
+                    });
+                  }
+                } else {
+                  groupMembers.push({
+                    id: `mem-${Date.now()}-${i}`,
+                    name: rawName,
+                    username: rawName.startsWith('@') ? rawName : `@member_${i + 1}`,
+                    role: 'member',
+                    avatarColor: '#65AADD',
+                    online: false,
+                    lastSeenText: 'был(а) недавно',
+                  });
+                }
+              }
+            }
+
+            const targetPresence = targetAcc
+              ? storage.getPresenceForAccount(targetAcc, onlineIds)
+              : null;
 
             const newChat: ChatThread = {
               id: p.id,
@@ -887,37 +1222,17 @@ async function startServer() {
               avatarUrl: targetAcc?.avatarUrl,
               avatarColor: targetAcc?.avatarColor || p.avatarColor || '#3390EC',
               ownerId: me.id,
-              participantIds: targetAcc ? [me.id, targetAcc.id] : [me.id],
-              online: p.type === 'private',
-              lastSeenText: p.type === 'private' ? 'в сети' : undefined,
+              participantIds,
+              online: targetPresence?.online ?? false,
+              lastSeenAt: targetPresence?.lastSeenAt,
+              lastSeenText: targetPresence?.lastSeenText,
               memberCount:
                 p.type === 'group'
-                  ? 1 + (p.memberNames?.length ?? 0)
+                  ? groupMembers?.length ?? 1
                   : p.type === 'channel'
                     ? 1
                     : undefined,
-              members:
-                p.type === 'group'
-                  ? [
-                      {
-                        id: me.id,
-                        name: buildFullName(me.firstName, me.lastName),
-                        username: `@${me.username}`,
-                        role: 'owner',
-                        avatarUrl: me.avatarUrl,
-                        avatarColor: me.avatarColor,
-                        online: true,
-                      },
-                      ...(p.memberNames ?? []).map((name, i) => ({
-                        id: `mem-${Date.now()}-${i}`,
-                        name,
-                        username: `@member_${i + 1}`,
-                        role: 'member' as const,
-                        avatarColor: '#65AADD',
-                        online: false,
-                      })),
-                    ]
-                  : undefined,
+              members: groupMembers,
               pinned: false,
               muted: false,
               archived: false,
@@ -927,32 +1242,39 @@ async function startServer() {
             };
 
             storage.upsertChat(newChat, []);
+            storage.publishClusterEvent({ type: 'chat:upsert', chat: newChat, messages: [] });
 
-            const targets = getTargetUserIdsForChat(newChat);
-            const evt: ServerWsEvent = {
+            broadcastPersonalizedChatEvent(newChat, (decoratedChat) => ({
               type: 'chat:created',
-              payload: { chat: newChat, messages: [] },
-            };
-            if (targets) broadcastToUsers(targets, evt);
-            else broadcastAll(evt);
+              payload: { chat: decoratedChat, messages: [] },
+            }));
             break;
           }
 
           case 'typing:set': {
             const chat = storage.getChatById(event.payload.chatId);
             if (!chat) break;
+            const senderName = buildFullName(me.firstName, me.lastName);
             const targets = getTargetUserIdsForChat(chat);
             const evt: ServerWsEvent = {
               type: 'typing:update',
               payload: {
                 chatId: event.payload.chatId,
                 userId: me.id,
-                userName: buildFullName(me.firstName, me.lastName),
+                userName: senderName,
                 isTyping: event.payload.isTyping,
               },
             };
             if (targets) broadcastToUsers(targets, evt, ws);
             else broadcastAll(evt, ws);
+
+            storage.publishClusterEvent({
+              type: 'typing:update',
+              chatId: event.payload.chatId,
+              userId: me.id,
+              userName: senderName,
+              isTyping: event.payload.isTyping,
+            });
             break;
           }
 
@@ -973,21 +1295,38 @@ async function startServer() {
             });
             if (updated) {
               const userProfile = storage.toUserProfile(updated, true);
+              const publicSummary = storage.toPublicUserSummary(
+                updated,
+                getOnlineUserIds(),
+              );
               broadcastToUsers(new Set([me.id]), {
                 type: 'profile:updated',
                 payload: { user: userProfile },
               });
+              broadcastAll({
+                type: 'user:profile_changed',
+                payload: { user: publicSummary },
+              });
+              broadcastAll({
+                type: 'directory:updated',
+                payload: { user: publicSummary },
+              });
+              storage.publishClusterEvent({ type: 'account:upsert', account: updated });
             }
             break;
           }
 
           case 'settings:update': {
+            const prevLastSeen = me.settings?.privacy?.lastSeen;
             const updated = storage.updateAccountSettings(me.id, event.payload);
             if (updated) {
               broadcastToUsers(new Set([me.id]), {
                 type: 'settings:updated',
                 payload: { settings: updated.settings },
               });
+              if (updated.settings?.privacy?.lastSeen !== prevLastSeen) {
+                broadcastPresenceForUser(me.id, true);
+              }
             }
             break;
           }
@@ -1181,6 +1520,10 @@ async function startServer() {
       activeClients.delete(ws);
       if (closed) {
         removeUserFromAllCalls(closed.userId);
+        if (!hasLocalConnectionForUser(closed.userId)) {
+          storage.touchAccountLastSeen(closed.userId);
+          broadcastPresenceForUser(closed.userId, true);
+        }
       }
       broadcastAll({
         type: 'presence:count',

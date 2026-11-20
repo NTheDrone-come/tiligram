@@ -13,6 +13,7 @@ import type {
 interface CreateChatModalProps {
   open: boolean;
   defaultType: ChatType;
+  directoryVersion?: number;
   onClose: () => void;
   onSearchUsers: (query: string) => Promise<PublicUserSummary[]>;
   onCreate: (params: {
@@ -29,6 +30,7 @@ interface CreateChatModalProps {
 export function CreateChatModal({
   open,
   defaultType,
+  directoryVersion = 0,
   onClose,
   onSearchUsers,
   onCreate,
@@ -63,19 +65,19 @@ export function CreateChatModal({
   useEffect(() => {
     if (!open || type !== 'private') return;
     let cancelled = false;
-    setSearchingUsers(true);
+    setSearchingUsers((prev) => (foundUsers.length === 0 ? true : prev));
     const timer = setTimeout(async () => {
       const users = await onSearchUsers(userSearch);
       if (!cancelled) {
         setFoundUsers(users);
         setSearchingUsers(false);
       }
-    }, 200);
+    }, 140);
     return () => {
       cancelled = true;
       clearTimeout(timer);
     };
-  }, [open, type, userSearch, onSearchUsers]);
+  }, [open, type, userSearch, onSearchUsers, directoryVersion]);
 
   if (!open) return null;
 
@@ -237,9 +239,18 @@ export function CreateChatModal({
                             <span className="text-xs">{u.statusEmoji}</span>
                           )}
                         </div>
-                        <div className="text-xs text-slate-500 dark:text-slate-400 truncate">
-                          {u.username}
-                          {u.bio ? ` · ${u.bio}` : ''}
+                        <div className="text-xs text-slate-500 dark:text-slate-400 truncate flex items-center gap-1.5">
+                          <span className="truncate">{u.username}</span>
+                          <span>·</span>
+                          <span
+                            className={
+                              u.online
+                                ? 'text-[#3390EC] dark:text-[#6AB3F3] font-medium shrink-0'
+                                : 'shrink-0'
+                            }
+                          >
+                            {u.online ? 'в сети' : u.lastSeenText || 'был(а) недавно'}
+                          </span>
                         </div>
                       </div>
                     </button>

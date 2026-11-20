@@ -312,12 +312,12 @@ export function CallOverlay({ call, currentUserId }: CallOverlayProps) {
           : 'grid-cols-2 md:grid-cols-3';
 
   return (
-    <div className="fixed inset-0 z-[70] flex items-center justify-center p-3 sm:p-6 bg-black/75 backdrop-blur-xs">
+    <div className="fixed inset-0 z-[70] flex items-center justify-center p-0 sm:p-6 bg-black/75 backdrop-blur-xs">
       <div
         role="dialog"
         aria-modal="true"
         aria-label={`Звонок: ${joinedCall.chatTitle}`}
-        className="w-full max-w-4xl h-[86vh] max-h-[720px] rounded-3xl bg-[#0F1722] text-white border border-white/10 shadow-2xl flex flex-col overflow-hidden"
+        className="w-full max-w-4xl h-[100dvh] sm:h-[86vh] sm:max-h-[720px] rounded-none sm:rounded-3xl bg-[#0F1722] text-white border-0 sm:border border-white/10 shadow-2xl flex flex-col overflow-hidden pt-safe pb-safe"
       >
         {/* Call Header */}
         <div className="px-5 py-4 border-b border-white/10 flex items-center justify-between gap-3 shrink-0">

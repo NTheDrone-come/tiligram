@@ -174,8 +174,8 @@ export function AuthScreen({ onAuthenticated }: AuthScreenProps) {
   };
 
   return (
-    <div className="h-screen w-screen overflow-y-auto bg-[#0E1621] text-slate-100 flex items-center justify-center p-4 sm:p-6">
-      <div className="w-full max-w-[430px] rounded-3xl bg-[#17212B] border border-[#243242] shadow-2xl p-6 sm:p-8">
+    <div className="min-h-[100dvh] h-[100dvh] w-full overflow-y-auto bg-[#0E1621] text-slate-100 flex flex-col items-center p-4 sm:p-6 pt-safe pb-safe">
+      <div className="my-auto w-full max-w-[430px] rounded-3xl bg-[#17212B] border border-[#243242] shadow-2xl p-5 sm:p-8">
         {/* Brand Header */}
         <div className="flex flex-col items-center text-center">
           <div className="w-16 h-16 rounded-full bg-[#3390EC] flex items-center justify-center shadow-lg shadow-[#3390EC]/25">

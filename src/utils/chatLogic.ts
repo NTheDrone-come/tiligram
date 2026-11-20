@@ -21,12 +21,26 @@ export interface GlobalMessageMatch {
 export interface SharedItemsSummary {
   media: ChatMessage[];
   files: ChatMessage[];
+  voice: ChatMessage[];
   links: Array<{
     messageId: string;
     url: string;
     senderName: string;
     createdAt: string;
   }>;
+}
+
+export interface ChatProfileStats {
+  totalMessages: number;
+  ownMessages: number;
+  peerMessages: number;
+  mediaCount: number;
+  filesCount: number;
+  voiceCount: number;
+  stickersCount: number;
+  linksCount: number;
+  firstMessageAt: string | null;
+  lastMessageAt: string | null;
 }
 
 export function buildFullName(firstName: string, lastName?: string): string {
@@ -428,6 +442,7 @@ export function validateProfileInput(input: {
 export function extractSharedItems(messages: ChatMessage[]): SharedItemsSummary {
   const media: ChatMessage[] = [];
   const files: ChatMessage[] = [];
+  const voice: ChatMessage[] = [];
   const links: SharedItemsSummary['links'] = [];
   const urlRegex = /https?:\/\/[^\s<>()]+/gi;
 
@@ -436,6 +451,8 @@ export function extractSharedItems(messages: ChatMessage[]): SharedItemsSummary 
       media.push(msg);
     } else if (msg.kind === 'file' && msg.attachment) {
       files.push(msg);
+    } else if (msg.kind === 'voice') {
+      voice.push(msg);
     }
 
     const foundUrls = msg.text.match(urlRegex);
@@ -451,7 +468,7 @@ export function extractSharedItems(messages: ChatMessage[]): SharedItemsSummary 
     }
   }
 
-  return { media, files, links };
+  return { media, files, voice, links };
 }
 
 export function getMessagePreviewText(message: ChatMessage | undefined): string {
@@ -528,4 +545,176 @@ export function getInitials(title: string): string {
   if (parts.length === 0) return '?';
   if (parts.length === 1) return parts[0].slice(0, 2).toUpperCase();
   return `${parts[0][0]}${parts[1][0]}`.toUpperCase();
+}
+
+export function formatLastSeen(
+  lastSeenAt?: string | null,
+  online?: boolean,
+  hidden = false,
+  now: Date = new Date(),
+): string {
+  if (hidden) return 'был(а) недавно';
+  if (online) return 'в сети';
+  if (!lastSeenAt) return 'был(а) недавно';
+
+  const date = new Date(lastSeenAt);
+  if (Number.isNaN(date.getTime())) return 'был(а) недавно';
+
+  const diffMs = Math.max(0, now.getTime() - date.getTime());
+  const diffSec = Math.floor(diffMs / 1000);
+  if (diffSec < 60) return 'был(а) только что';
+
+  const diffMin = Math.floor(diffSec / 60);
+  if (diffMin < 60) return `был(а) ${diffMin} мин. назад`;
+
+  const timeStr = date.toLocaleTimeString('ru-RU', {
+    hour: '2-digit',
+    minute: '2-digit',
+  });
+
+  const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const startOfDate = new Date(date.getFullYear(), date.getMonth(), date.getDate());
+  const diffDays = Math.round(
+    (startOfToday.getTime() - startOfDate.getTime()) / 86_400_000,
+  );
+
+  if (diffDays === 0) return `был(а) сегодня в ${timeStr}`;
+  if (diffDays === 1) return `был(а) вчера в ${timeStr}`;
+
+  const dateStr = date.toLocaleDateString('ru-RU', {
+    day: 'numeric',
+    month: 'short',
+  });
+  return `был(а) ${dateStr} в ${timeStr}`;
+}
+
+function pluralizeYearsRu(years: number): string {
+  const abs = Math.abs(years) % 100;
+  const last = abs % 10;
+  if (abs >= 11 && abs <= 19) return `${years} лет`;
+  if (last === 1) return `${years} год`;
+  if (last >= 2 && last <= 4) return `${years} года`;
+  return `${years} лет`;
+}
+
+export function formatBirthdayWithAge(
+  birthday?: string | null,
+  now: Date = new Date(),
+): string | null {
+  const raw = (birthday ?? '').trim();
+  if (!raw) return null;
+
+  let year: number | null = null;
+  let month: number | null = null;
+  let day: number | null = null;
+
+  const isoMatch = raw.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  const ruMatch = raw.match(/^(\d{2})\.(\d{2})\.(\d{4})$/);
+
+  if (isoMatch) {
+    year = Number(isoMatch[1]);
+    month = Number(isoMatch[2]);
+    day = Number(isoMatch[3]);
+  } else if (ruMatch) {
+    day = Number(ruMatch[1]);
+    month = Number(ruMatch[2]);
+    year = Number(ruMatch[3]);
+  }
+
+  if (
+    year === null ||
+    month === null ||
+    day === null ||
+    month < 1 ||
+    month > 12 ||
+    day < 1 ||
+    day > 31
+  ) {
+    return raw;
+  }
+
+  const date = new Date(year, month - 1, day);
+  if (
+    Number.isNaN(date.getTime()) ||
+    date.getFullYear() !== year ||
+    date.getMonth() !== month - 1 ||
+    date.getDate() !== day
+  ) {
+    return raw;
+  }
+
+  const formattedDate = date.toLocaleDateString('ru-RU', {
+    day: 'numeric',
+    month: 'long',
+    year: 'numeric',
+  });
+
+  let age = now.getFullYear() - year;
+  const monthDiff = now.getMonth() - (month - 1);
+  if (monthDiff < 0 || (monthDiff === 0 && now.getDate() < day)) {
+    age -= 1;
+  }
+
+  if (age > 0 && age < 130) {
+    return `${formattedDate} · ${pluralizeYearsRu(age)}`;
+  }
+  return formattedDate;
+}
+
+export function formatMemberSince(createdAt?: string | null): string | null {
+  if (!createdAt) return null;
+  const date = new Date(createdAt);
+  if (Number.isNaN(date.getTime())) return null;
+  return date.toLocaleDateString('ru-RU', {
+    day: 'numeric',
+    month: 'long',
+    year: 'numeric',
+  });
+}
+
+export function computeChatProfileStats(
+  messages: ChatMessage[],
+  currentUserId?: string,
+): ChatProfileStats {
+  const shared = extractSharedItems(messages);
+  let ownMessages = 0;
+  let peerMessages = 0;
+  let stickersCount = 0;
+
+  for (const msg of messages) {
+    if (currentUserId && msg.senderId === currentUserId) {
+      ownMessages += 1;
+    } else {
+      peerMessages += 1;
+    }
+    if (msg.kind === 'sticker') {
+      stickersCount += 1;
+    }
+  }
+
+  return {
+    totalMessages: messages.length,
+    ownMessages,
+    peerMessages,
+    mediaCount: shared.media.length,
+    filesCount: shared.files.length,
+    voiceCount: shared.voice.length,
+    stickersCount,
+    linksCount: shared.links.length,
+    firstMessageAt: messages.length > 0 ? messages[0].createdAt : null,
+    lastMessageAt: messages.length > 0 ? messages[messages.length - 1].createdAt : null,
+  };
+}
+
+export function findCommonGroups(
+  chats: ChatThread[],
+  peerUserId?: string | null,
+): ChatThread[] {
+  if (!peerUserId) return [];
+  return chats.filter(
+    (c) =>
+      c.type === 'group' &&
+      (c.participantIds?.includes(peerUserId) ||
+        c.members?.some((m) => m.id === peerUserId)),
+  );
 }

@@ -13,6 +13,7 @@ import {
   X,
 } from 'lucide-react';
 import { Avatar } from './Avatar';
+import { PWAInstallButton } from './PWAInstallButton';
 import type { AppSettings, ChatType, UserProfile } from '../types/telegram';
 import type { SettingsTabId } from './SettingsModal';
 
@@ -64,11 +65,11 @@ export function NavigationDrawer({
       {/* Slide-out Panel */}
       <nav
         aria-label="Главное меню Тилиграм"
-        className="relative z-10 w-[300px] max-w-[85vw] h-full bg-white dark:bg-[#17212B] shadow-2xl flex flex-col"
+        className="relative z-10 w-[300px] max-w-[85vw] h-full bg-white dark:bg-[#17212B] shadow-2xl flex flex-col pb-safe"
       >
         {/* User Header */}
         <div
-          className="px-5 pt-5 pb-4 text-white"
+          className="px-5 pt-5 pb-4 pt-safe text-white"
           style={{
             background: `linear-gradient(135deg, ${currentUser.profileAccent || '#3390EC'} 0%, #162436 100%)`,
           }}
@@ -221,6 +222,8 @@ export function NavigationDrawer({
             <Settings className="w-5 h-5 text-slate-500 dark:text-slate-400" />
             <span>Настройки</span>
           </button>
+
+          <PWAInstallButton variant="drawer" onAfterClick={onClose} />
 
           <div className="my-1.5 border-t border-slate-100 dark:border-[#0E1621]" />
 
