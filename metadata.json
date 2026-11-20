@@ -1,0 +1,6 @@
+{
+  "name": "Телеграм",
+  "description": "Быстрый веб-мессенджер в стиле Telegram с чатами, группами, каналами, реакциями, голосовыми сообщениями и синхронизацией в реальном времени.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
