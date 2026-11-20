@@ -1,6 +1,7 @@
-import { useCallback, useEffect, useState } from 'react';
-import { Loader2, Send } from 'lucide-react';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { Download, Loader2, Send, X } from 'lucide-react';
 import { AuthScreen } from './components/AuthScreen';
+import { CallOverlay } from './components/CallOverlay';
 import { ChatInfoPanel } from './components/ChatInfoPanel';
 import { ChatSidebar } from './components/ChatSidebar';
 import { ChatWindow } from './components/ChatWindow';
@@ -10,14 +11,24 @@ import {
   PhotoLightbox,
 } from './components/Modals';
 import { NavigationDrawer } from './components/NavigationDrawer';
+import {
+  NotificationPopups,
+  type TelegramPopupNotification,
+} from './components/NotificationPopups';
 import { SettingsModal, type SettingsTabId } from './components/SettingsModal';
 import { StickerStudioModal } from './components/StickerStudioModal';
 import { DEFAULT_APP_SETTINGS } from './data/seedData';
+import { useAppUpdater } from './hooks/useAppUpdater';
 import { useTelegramSocket } from './hooks/useTelegramSocket';
+import { useWebRTCCall } from './hooks/useWebRTCCall';
+import { playMessageNotificationSound } from './utils/sounds';
 import type {
+  ActiveCallRoom,
   AppSettings,
+  CallSignalPayload,
   ChatFolder,
   ChatMessage,
+  ChatThread,
   ChatType,
   CustomSticker,
   UserProfile,
@@ -39,6 +50,49 @@ export default function App() {
     DEFAULT_APP_SETTINGS,
   );
 
+  const [activeChatId, setActiveChatId] = useState<string | null>(null);
+  const [mobileShowChat, setMobileShowChat] = useState(false);
+  const [folder, setFolder] = useState<ChatFolder>('all');
+  const [searchQuery, setSearchQuery] = useState('');
+  const [showArchived, setShowArchived] = useState(false);
+  const [showInfoPanel, setShowInfoPanel] = useState(false);
+  const [drawerOpen, setDrawerOpen] = useState(false);
+  const [createModal, setCreateModal] = useState<{ open: boolean; type: ChatType }>({
+    open: false,
+    type: 'private',
+  });
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [settingsTab, setSettingsTab] = useState<SettingsTabId>('profile');
+  const [stickerStudioOpen, setStickerStudioOpen] = useState(false);
+  const [forwardingMsg, setForwardingMsg] = useState<ChatMessage | null>(null);
+  const [lightbox, setLightbox] = useState<{ url: string; caption?: string } | null>(
+    null,
+  );
+  const [highlightMessageId, setHighlightMessageId] = useState<string | null>(null);
+  const [popups, setPopups] = useState<TelegramPopupNotification[]>([]);
+
+  const activeChatIdRef = useRef<string | null>(activeChatId);
+  activeChatIdRef.current = activeChatId;
+
+  const settingsRef = useRef<AppSettings>(DEFAULT_APP_SETTINGS);
+  const callHandlersRef = useRef<{
+    onIncomingCall: (call: ActiveCallRoom) => void;
+    onCallSignal: (payload: {
+      callId: string;
+      fromUserId: string;
+      signal: CallSignalPayload;
+    }) => void;
+    onCallEnded: (payload: {
+      callId: string;
+      chatId: string;
+      reason?: string;
+    }) => void;
+  }>({
+    onIncomingCall: () => {},
+    onCallSignal: () => {},
+    onCallEnded: () => {},
+  });
+
   const handleLogout = useCallback(() => {
     try {
       localStorage.removeItem(AUTH_TOKEN_KEY);
@@ -51,6 +105,7 @@ export default function App() {
     setDrawerOpen(false);
     setSettingsOpen(false);
     setStickerStudioOpen(false);
+    setPopups([]);
   }, []);
 
   // Verify saved session token on initial load
@@ -76,7 +131,18 @@ export default function App() {
         if (!cancelled) {
           setInitialUser(data.user as UserProfile);
           if (data.settings) {
-            setInitialSettings({ ...DEFAULT_APP_SETTINGS, ...data.settings });
+            setInitialSettings({
+              ...DEFAULT_APP_SETTINGS,
+              ...data.settings,
+              notifications: {
+                ...DEFAULT_APP_SETTINGS.notifications,
+                ...(data.settings.notifications ?? {}),
+              },
+              updates: {
+                ...DEFAULT_APP_SETTINGS.updates!,
+                ...(data.settings.updates ?? {}),
+              },
+            });
           }
           setCheckingAuth(false);
         }
@@ -91,32 +157,166 @@ export default function App() {
     };
   }, [authToken, handleLogout]);
 
+  const dispatchPopupNotification = useCallback(
+    (item: TelegramPopupNotification, force = false) => {
+      const cfg = settingsRef.current.notifications;
+      if (!force && cfg.desktopPopups === false) return;
+
+      if (cfg.soundEnabled) {
+        playMessageNotificationSound();
+      }
+
+      // 1. Always show crisp Telegram-style bottom-right popup card inside the app
+      setPopups((prev) => [item, ...prev.filter((p) => p.id !== item.id)].slice(0, 4));
+
+      // 2. If running inside Electron Desktop, also dispatch real OS/desktop popup
+      if (window.tiligramDesktop?.showNotification) {
+        void window.tiligramDesktop.showNotification({
+          chatId: item.chatId,
+          title: item.title,
+          subtitle: item.subtitle,
+          body: item.body,
+          avatarColor: item.avatarColor,
+          silent: !cfg.soundEnabled,
+          style: cfg.popupStyle || 'telegram-popup',
+        });
+        return;
+      }
+
+      // 3. In web browser, also trigger native OS Notification if permission is granted
+      if (
+        typeof window !== 'undefined' &&
+        'Notification' in window &&
+        Notification.permission === 'granted' &&
+        (force || document.hidden || activeChatIdRef.current !== item.chatId)
+      ) {
+        try {
+          const nativeNotif = new Notification(item.title, {
+            body: item.subtitle ? `${item.subtitle}: ${item.body}` : item.body,
+            tag: item.chatId,
+            silent: !cfg.soundEnabled,
+          });
+          nativeNotif.onclick = () => {
+            window.focus();
+            setActiveChatId(item.chatId);
+            setMobileShowChat(true);
+            nativeNotif.close();
+          };
+        } catch {
+          // ignore browser notification error
+        }
+      }
+    },
+    [],
+  );
+
+  const handleIncomingMessage = useCallback(
+    ({ message, chat }: { message: ChatMessage; chat: ChatThread }) => {
+      if (chat.muted) return;
+      const cfg = settingsRef.current.notifications;
+      if (chat.type === 'private' && !cfg.privateChats) return;
+      if (chat.type === 'group' && !cfg.groups) return;
+      if (chat.type === 'channel' && !cfg.channels) return;
+
+      const isCurrentlyFocusedOnChat =
+        !document.hidden && activeChatIdRef.current === chat.id;
+      if (isCurrentlyFocusedOnChat) return;
+
+      const previewBody = cfg.showPreview
+        ? message.text ||
+          (message.kind === 'image'
+            ? 'Фотография'
+            : message.kind === 'voice'
+              ? 'Голосовое сообщение'
+              : message.kind === 'sticker'
+                ? `${message.attachment?.stickerEmoji || ''} Стикер`.trim()
+                : message.attachment?.name || 'Файл')
+        : 'Новое сообщение';
+
+      dispatchPopupNotification({
+        id: `notif-${message.id}`,
+        chatId: chat.id,
+        chatType: chat.type,
+        title: chat.title,
+        subtitle:
+          chat.type === 'group' ? message.senderName : undefined,
+        body: previewBody,
+        avatarUrl: chat.avatarUrl,
+        avatarColor: chat.avatarColor,
+        createdAt: message.createdAt,
+      });
+    },
+    [dispatchPopupNotification],
+  );
+
   const tg = useTelegramSocket({
     token: checkingAuth ? null : authToken,
     initialUser,
     initialSettings,
     onAuthExpired: handleLogout,
+    onIncomingMessage: handleIncomingMessage,
+    onIncomingCall: (call) => callHandlersRef.current.onIncomingCall(call),
+    onCallSignal: (payload) => callHandlersRef.current.onCallSignal(payload),
+    onCallEnded: (payload) => callHandlersRef.current.onCallEnded(payload),
   });
 
-  const [activeChatId, setActiveChatId] = useState<string | null>(null);
-  const [mobileShowChat, setMobileShowChat] = useState(false);
-  const [folder, setFolder] = useState<ChatFolder>('all');
-  const [searchQuery, setSearchQuery] = useState('');
-  const [showArchived, setShowArchived] = useState(false);
-  const [showInfoPanel, setShowInfoPanel] = useState(false);
-  const [drawerOpen, setDrawerOpen] = useState(false);
-  const [createModal, setCreateModal] = useState<{ open: boolean; type: ChatType }>({
-    open: false,
-    type: 'private',
+  settingsRef.current = tg.settings;
+
+  const callController = useWebRTCCall({
+    currentUserId: tg.currentUser?.id ?? null,
+    activeCalls: tg.activeCalls,
+    soundEnabled: tg.settings.notifications.soundEnabled,
+    startCallWs: tg.startCall,
+    joinCallWs: tg.joinCall,
+    declineCallWs: tg.declineCall,
+    leaveCallWs: tg.leaveCall,
+    sendSignalWs: tg.sendCallSignal,
+    updateMediaStateWs: tg.updateCallMediaState,
   });
-  const [settingsOpen, setSettingsOpen] = useState(false);
-  const [settingsTab, setSettingsTab] = useState<SettingsTabId>('profile');
-  const [stickerStudioOpen, setStickerStudioOpen] = useState(false);
-  const [forwardingMsg, setForwardingMsg] = useState<ChatMessage | null>(null);
-  const [lightbox, setLightbox] = useState<{ url: string; caption?: string } | null>(
-    null,
+
+  callHandlersRef.current = {
+    onIncomingCall: (call) => {
+      callController.handleIncomingCallEvent(call);
+      if (window.tiligramDesktop?.showNotification) {
+        void window.tiligramDesktop.showNotification({
+          chatId: call.chatId,
+          title: call.chatTitle,
+          subtitle:
+            call.chatType === 'group' ? 'Групповой звонок' : 'Входящий звонок',
+          body: `${call.initiatorName} приглашает в ${call.mode === 'video' ? 'видеозвонок' : 'аудиозвонок'}`,
+          avatarColor: '#10B981',
+          silent: true,
+          style: tg.settings.notifications.popupStyle || 'telegram-popup',
+        });
+      }
+    },
+    onCallSignal: callController.handleCallSignalEvent,
+    onCallEnded: callController.handleCallEndedEvent,
+  };
+
+  const updater = useAppUpdater(
+    tg.settings.updates?.githubRepo,
+    tg.settings.updates?.autoCheck ?? true,
   );
-  const [highlightMessageId, setHighlightMessageId] = useState<string | null>(null);
+
+  // Sync Electron desktop notification click -> jump straight to chat
+  useEffect(() => {
+    if (!window.tiligramDesktop?.onNotificationClick) return;
+    return window.tiligramDesktop.onNotificationClick(({ chatId }) => {
+      if (chatId) {
+        setActiveChatId(chatId);
+        setMobileShowChat(true);
+        tg.markChatRead(chatId);
+      }
+    });
+  }, [tg.markChatRead]);
+
+  // Sync unread badge count to Electron taskbar/dock icon
+  useEffect(() => {
+    if (!window.tiligramDesktop?.setBadgeCount) return;
+    const totalUnread = tg.chats.reduce((acc, c) => acc + (c.unreadCount || 0), 0);
+    void window.tiligramDesktop.setBadgeCount(totalUnread);
+  }, [tg.chats]);
 
   // Sync Tailwind v4 dark class & CSS accent variable (dark theme by default)
   useEffect(() => {
@@ -189,7 +389,18 @@ export default function App() {
             // ignore
           }
           setInitialUser(user);
-          setInitialSettings({ ...DEFAULT_APP_SETTINGS, ...settings });
+          setInitialSettings({
+            ...DEFAULT_APP_SETTINGS,
+            ...settings,
+            notifications: {
+              ...DEFAULT_APP_SETTINGS.notifications,
+              ...(settings?.notifications ?? {}),
+            },
+            updates: {
+              ...DEFAULT_APP_SETTINGS.updates!,
+              ...(settings?.updates ?? {}),
+            },
+          });
           setAuthToken(token);
         }}
       />
@@ -199,6 +410,13 @@ export default function App() {
   const activeChat = tg.chats.find((c) => c.id === activeChatId) ?? null;
   const activeMessages = activeChatId ? tg.messagesByChat[activeChatId] ?? [] : [];
   const archivedCount = tg.chats.filter((c) => c.archived).length;
+  const activeCallInChat = activeChat
+    ? tg.activeCalls.find((c) => c.chatId === activeChat.id) ?? null
+    : null;
+  const isJoinedToChatCall = Boolean(
+    activeCallInChat &&
+      callController.joinedCall?.callId === activeCallInChat.callId,
+  );
 
   const handleSelectChat = (chatId: string, jumpToMessageId?: string) => {
     setActiveChatId(chatId);
@@ -249,74 +467,144 @@ export default function App() {
     setSettingsOpen(true);
   };
 
+  const handleTestNotification = () => {
+    const targetChat = activeChat ?? tg.chats[0];
+    if (!targetChat) return;
+    dispatchPopupNotification(
+      {
+        id: `test-notif-${Date.now()}`,
+        chatId: targetChat.id,
+        chatType: targetChat.type,
+        title: targetChat.title,
+        subtitle: tg.currentUser?.name,
+        body: 'Так выглядят всплывающие уведомления Тилиграм. Можно ответить прямо отсюда!',
+        avatarUrl: targetChat.avatarUrl,
+        avatarColor: targetChat.avatarColor || '#3390EC',
+        createdAt: new Date().toISOString(),
+      },
+      true,
+    );
+  };
+
+  const showUpdateBanner =
+    !updater.bannerDismissed &&
+    (updater.updateInfo.status === 'available' ||
+      updater.updateInfo.status === 'downloaded');
+
   return (
-    <div className="h-screen w-screen overflow-hidden flex bg-white dark:bg-[#0E1621] text-slate-900 dark:text-slate-100">
-      {/* Left Sidebar */}
-      <div
-        className={`${
-          mobileShowChat ? 'hidden md:flex' : 'flex'
-        } h-full w-full md:w-auto shrink-0`}
-      >
-        <ChatSidebar
-          chats={tg.chats}
-          messagesByChat={tg.messagesByChat}
-          currentUserId={tg.currentUser.id}
-          activeChatId={activeChatId}
-          folder={folder}
-          searchQuery={searchQuery}
-          showArchived={showArchived}
-          onSelectChat={handleSelectChat}
-          onChangeFolder={setFolder}
-          onChangeSearch={setSearchQuery}
-          onToggleArchiveView={setShowArchived}
-          onOpenDrawer={() => setDrawerOpen(true)}
-          onOpenCreateModal={() => setCreateModal({ open: true, type: 'private' })}
-        />
-      </div>
+    <div className="h-screen w-screen overflow-hidden flex flex-col bg-white dark:bg-[#0E1621] text-slate-900 dark:text-slate-100">
+      {/* Real GitHub Release Auto-Update Banner (only shown when a newer release exists) */}
+      {showUpdateBanner && (
+        <div className="px-4 py-2 bg-[#3390EC] text-white text-xs sm:text-[13px] flex items-center justify-between gap-3 shrink-0 z-30">
+          <div className="flex items-center gap-2 min-w-0">
+            <Download className="w-4 h-4 shrink-0" />
+            <span className="font-semibold truncate">
+              {updater.updateInfo.status === 'downloaded'
+                ? `Обновление Тилиграм v${updater.updateInfo.latestVersion} готово к установке`
+                : `Доступна новая версия Тилиграм v${updater.updateInfo.latestVersion} на GitHub`}
+            </span>
+          </div>
+          <div className="flex items-center gap-2 shrink-0">
+            <button
+              type="button"
+              onClick={() =>
+                updater.updateInfo.status === 'downloaded'
+                  ? void updater.installUpdate()
+                  : void updater.downloadUpdate()
+              }
+              className="px-3 py-1 rounded-lg bg-white text-[#1E6BB8] font-semibold hover:bg-white/90 cursor-pointer whitespace-nowrap"
+            >
+              {updater.updateInfo.status === 'downloaded'
+                ? 'Перезапустить'
+                : updater.isElectron
+                  ? 'Обновить'
+                  : 'Скачать'}
+            </button>
+            <button
+              type="button"
+              onClick={updater.dismissBanner}
+              aria-label="Скрыть уведомление об обновлении"
+              className="w-6 h-6 rounded-full flex items-center justify-center hover:bg-white/15 cursor-pointer"
+            >
+              <X className="w-3.5 h-3.5" />
+            </button>
+          </div>
+        </div>
+      )}
 
-      {/* Center Chat Viewport */}
-      <div
-        className={`${
-          mobileShowChat ? 'flex' : 'hidden md:flex'
-        } flex-1 min-w-0 h-full`}
-      >
-        <ChatWindow
-          chat={activeChat}
-          messages={activeMessages}
-          currentUserId={tg.currentUser.id}
-          typingState={activeChatId ? tg.typingByChat[activeChatId] : undefined}
-          settings={tg.settings}
-          stickerPacks={tg.stickerPacks}
-          highlightMessageId={highlightMessageId}
-          showInfoPanel={showInfoPanel}
-          onBackMobile={() => setMobileShowChat(false)}
-          onToggleInfoPanel={() => setShowInfoPanel((prev) => !prev)}
-          onSendMessage={tg.sendMessage}
-          onUploadFile={tg.uploadFile}
-          onOpenStickerStudio={() => setStickerStudioOpen(true)}
-          onEditMessage={tg.editMessage}
-          onDeleteMessage={tg.deleteMessage}
-          onToggleReaction={tg.toggleReaction}
-          onPinMessage={tg.pinMessage}
-          onForwardMessage={(m) => setForwardingMsg(m)}
-          onUpdateChatFlags={tg.updateChatFlags}
-          onClearHistory={tg.clearChatHistory}
-          onTyping={tg.sendTyping}
-          onOpenLightbox={(url, caption) => setLightbox({ url, caption })}
-          onClearHighlight={() => setHighlightMessageId(null)}
-        />
+      <div className="flex-1 min-h-0 w-full flex overflow-hidden">
+        {/* Left Sidebar */}
+        <div
+          className={`${
+            mobileShowChat ? 'hidden md:flex' : 'flex'
+          } h-full w-full md:w-auto shrink-0`}
+        >
+          <ChatSidebar
+            chats={tg.chats}
+            messagesByChat={tg.messagesByChat}
+            currentUserId={tg.currentUser.id}
+            activeChatId={activeChatId}
+            folder={folder}
+            searchQuery={searchQuery}
+            showArchived={showArchived}
+            onSelectChat={handleSelectChat}
+            onChangeFolder={setFolder}
+            onChangeSearch={setSearchQuery}
+            onToggleArchiveView={setShowArchived}
+            onOpenDrawer={() => setDrawerOpen(true)}
+            onOpenCreateModal={() => setCreateModal({ open: true, type: 'private' })}
+          />
+        </div>
 
-        {/* Right Chat Info Inspector */}
-        {showInfoPanel && activeChat && (
-          <ChatInfoPanel
+        {/* Center Chat Viewport */}
+        <div
+          className={`${
+            mobileShowChat ? 'flex' : 'hidden md:flex'
+          } flex-1 min-w-0 h-full`}
+        >
+          <ChatWindow
             chat={activeChat}
             messages={activeMessages}
-            onClose={() => setShowInfoPanel(false)}
-            onToggleMute={(id, muted) => tg.updateChatFlags(id, { muted })}
+            currentUserId={tg.currentUser.id}
+            typingState={activeChatId ? tg.typingByChat[activeChatId] : undefined}
+            settings={tg.settings}
+            stickerPacks={tg.stickerPacks}
+            activeCallInChat={activeCallInChat}
+            isJoinedToChatCall={isJoinedToChatCall}
+            highlightMessageId={highlightMessageId}
+            showInfoPanel={showInfoPanel}
+            onBackMobile={() => setMobileShowChat(false)}
+            onToggleInfoPanel={() => setShowInfoPanel((prev) => !prev)}
+            onSendMessage={tg.sendMessage}
+            onUploadFile={tg.uploadFile}
+            onOpenStickerStudio={() => setStickerStudioOpen(true)}
+            onEditMessage={tg.editMessage}
+            onDeleteMessage={tg.deleteMessage}
+            onToggleReaction={tg.toggleReaction}
+            onPinMessage={tg.pinMessage}
+            onForwardMessage={(m) => setForwardingMsg(m)}
+            onUpdateChatFlags={tg.updateChatFlags}
+            onClearHistory={tg.clearChatHistory}
+            onTyping={tg.sendTyping}
             onOpenLightbox={(url, caption) => setLightbox({ url, caption })}
-            onJumpToMessage={(messageId) => setHighlightMessageId(messageId)}
+            onClearHighlight={() => setHighlightMessageId(null)}
+            onStartCall={(chatId, mode) => void callController.initiateCall(chatId, mode)}
+            onJoinCall={(call) => void callController.joinExistingCall(call)}
+            onOpenActiveCall={() => callController.setMinimized(false)}
           />
-        )}
+
+          {/* Right Chat Info Inspector */}
+          {showInfoPanel && activeChat && (
+            <ChatInfoPanel
+              chat={activeChat}
+              messages={activeMessages}
+              onClose={() => setShowInfoPanel(false)}
+              onToggleMute={(id, muted) => tg.updateChatFlags(id, { muted })}
+              onOpenLightbox={(url, caption) => setLightbox({ url, caption })}
+              onJumpToMessage={(messageId) => setHighlightMessageId(messageId)}
+            />
+          )}
+        </div>
       </div>
 
       {/* Slide-out Navigation Drawer */}
@@ -325,6 +613,8 @@ export default function App() {
         currentUser={tg.currentUser}
         settings={tg.settings}
         archivedCount={archivedCount}
+        appVersion={updater.updateInfo.currentVersion}
+        isElectron={updater.isElectron}
         onClose={() => setDrawerOpen(false)}
         onToggleTheme={() =>
           tg.updateSettings({
@@ -377,6 +667,7 @@ export default function App() {
         currentUser={tg.currentUser}
         settings={tg.settings}
         stickerPacks={tg.stickerPacks}
+        updater={updater}
         onClose={() => setSettingsOpen(false)}
         onSaveProfile={tg.updateProfile}
         onChangeSettings={tg.updateSettings}
@@ -384,6 +675,7 @@ export default function App() {
           setSettingsOpen(false);
           setStickerStudioOpen(true);
         }}
+        onTestNotification={handleTestNotification}
         onLogout={handleLogout}
       />
 
@@ -401,6 +693,28 @@ export default function App() {
       />
 
       <PhotoLightbox item={lightbox} onClose={() => setLightbox(null)} />
+
+      {/* Telegram-style Bottom-Right Interactive Popup Notifications */}
+      <NotificationPopups
+        items={popups}
+        onDismiss={(id) => setPopups((prev) => prev.filter((p) => p.id !== id))}
+        onOpenChat={(chatId, popupId) => {
+          setPopups((prev) => prev.filter((p) => p.id !== popupId));
+          handleSelectChat(chatId);
+        }}
+        onMarkRead={(chatId, popupId) => {
+          setPopups((prev) => prev.filter((p) => p.id !== popupId));
+          tg.markChatRead(chatId);
+        }}
+        onQuickReply={(chatId, text, popupId) => {
+          tg.sendMessage({ chatId, kind: 'text', text });
+          tg.markChatRead(chatId);
+          setPopups((prev) => prev.filter((p) => p.id !== popupId));
+        }}
+      />
+
+      {/* Real WebRTC P2P & Group Call Overlay */}
+      <CallOverlay call={callController} currentUserId={tg.currentUser.id} />
     </div>
   );
 }

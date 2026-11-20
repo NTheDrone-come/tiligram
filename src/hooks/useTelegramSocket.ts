@@ -9,7 +9,10 @@ import {
   toggleReactionOnList,
 } from '../utils/chatLogic';
 import type {
+  ActiveCallRoom,
   AppSettings,
+  CallMode,
+  CallSignalPayload,
   ChatMessage,
   ChatThread,
   ChatType,
@@ -31,6 +34,7 @@ export interface TelegramSyncApi {
   chats: ChatThread[];
   messagesByChat: Record<string, ChatMessage[]>;
   stickerPacks: StickerPack[];
+  activeCalls: ActiveCallRoom[];
   typingByChat: Record<string, TypingState | undefined>;
   onlineClientCount: number;
   sendMessage: (params: {
@@ -94,6 +98,19 @@ export interface TelegramSyncApi {
   ) => Promise<{ ok: boolean; error?: string }>;
   removeStickerFromPack: (packId: string, stickerId: string) => Promise<void>;
   deleteStickerPack: (packId: string) => Promise<void>;
+  startCall: (chatId: string, mode: CallMode) => void;
+  joinCall: (callId: string, mode?: CallMode) => void;
+  declineCall: (callId: string) => void;
+  leaveCall: (callId: string) => void;
+  sendCallSignal: (
+    callId: string,
+    targetUserId: string,
+    signal: CallSignalPayload,
+  ) => void;
+  updateCallMediaState: (
+    callId: string,
+    state: { micMuted: boolean; videoEnabled: boolean; screenSharing: boolean },
+  ) => void;
 }
 
 interface UseTelegramSocketOptions {
@@ -101,6 +118,18 @@ interface UseTelegramSocketOptions {
   initialUser: UserProfile | null;
   initialSettings?: AppSettings;
   onAuthExpired: () => void;
+  onIncomingMessage?: (payload: { message: ChatMessage; chat: ChatThread }) => void;
+  onIncomingCall?: (call: ActiveCallRoom) => void;
+  onCallSignal?: (payload: {
+    callId: string;
+    fromUserId: string;
+    signal: CallSignalPayload;
+  }) => void;
+  onCallEnded?: (payload: {
+    callId: string;
+    chatId: string;
+    reason?: string;
+  }) => void;
 }
 
 export function useTelegramSocket({
@@ -108,6 +137,10 @@ export function useTelegramSocket({
   initialUser,
   initialSettings,
   onAuthExpired,
+  onIncomingMessage,
+  onIncomingCall,
+  onCallSignal,
+  onCallEnded,
 }: UseTelegramSocketOptions): TelegramSyncApi {
   const [connected, setConnected] = useState(false);
   const [initialized, setInitialized] = useState(false);
@@ -118,6 +151,7 @@ export function useTelegramSocket({
   const [chats, setChats] = useState<ChatThread[]>([]);
   const [messagesByChat, setMessagesByChat] = useState<Record<string, ChatMessage[]>>({});
   const [stickerPacks, setStickerPacks] = useState<StickerPack[]>(createStarterStickerPacks);
+  const [activeCalls, setActiveCalls] = useState<ActiveCallRoom[]>([]);
   const [typingByChat, setTypingByChat] = useState<
     Record<string, TypingState | undefined>
   >({});
@@ -130,6 +164,14 @@ export function useTelegramSocket({
   currentUserRef.current = currentUser;
   const onAuthExpiredRef = useRef(onAuthExpired);
   onAuthExpiredRef.current = onAuthExpired;
+  const onIncomingMessageRef = useRef(onIncomingMessage);
+  onIncomingMessageRef.current = onIncomingMessage;
+  const onIncomingCallRef = useRef(onIncomingCall);
+  onIncomingCallRef.current = onIncomingCall;
+  const onCallSignalRef = useRef(onCallSignal);
+  onCallSignalRef.current = onCallSignal;
+  const onCallEndedRef = useRef(onCallEnded);
+  onCallEndedRef.current = onCallEnded;
 
   useEffect(() => {
     if (initialUser) setCurrentUser(initialUser);
@@ -187,11 +229,31 @@ export function useTelegramSocket({
             case 'sync:init': {
               setCurrentUser(msg.payload.currentUser);
               if (msg.payload.settings) {
-                setSettings({ ...DEFAULT_APP_SETTINGS, ...msg.payload.settings });
+                setSettings({
+                  ...DEFAULT_APP_SETTINGS,
+                  ...msg.payload.settings,
+                  notifications: {
+                    ...DEFAULT_APP_SETTINGS.notifications,
+                    ...(msg.payload.settings.notifications ?? {}),
+                  },
+                  privacy: {
+                    ...DEFAULT_APP_SETTINGS.privacy,
+                    ...(msg.payload.settings.privacy ?? {}),
+                  },
+                  storage: {
+                    ...DEFAULT_APP_SETTINGS.storage,
+                    ...(msg.payload.settings.storage ?? {}),
+                  },
+                  updates: {
+                    ...DEFAULT_APP_SETTINGS.updates!,
+                    ...(msg.payload.settings.updates ?? {}),
+                  },
+                });
               }
               setChats(msg.payload.chats);
               setMessagesByChat(msg.payload.messagesByChat);
               setStickerPacks(msg.payload.stickerPacks);
+              setActiveCalls(msg.payload.activeCalls ?? []);
               setOnlineClientCount(msg.payload.onlineClientCount);
               setInitialized(true);
               break;
@@ -210,6 +272,12 @@ export function useTelegramSocket({
                 if (!exists) return [chat, ...prev];
                 return prev.map((c) => (c.id === chat.id ? { ...c, ...chat } : c));
               });
+              if (
+                currentUserRef.current &&
+                message.senderId !== currentUserRef.current.id
+              ) {
+                onIncomingMessageRef.current?.({ message, chat });
+              }
               break;
             }
             case 'message:updated': {
@@ -293,6 +361,40 @@ export function useTelegramSocket({
             }
             case 'presence:count': {
               setOnlineClientCount(msg.payload.onlineClientCount);
+              break;
+            }
+            case 'call:incoming': {
+              const { call } = msg.payload;
+              setActiveCalls((prev) => {
+                const idx = prev.findIndex((c) => c.callId === call.callId);
+                if (idx >= 0) {
+                  return prev.map((c) => (c.callId === call.callId ? call : c));
+                }
+                return [call, ...prev];
+              });
+              onIncomingCallRef.current?.(call);
+              break;
+            }
+            case 'call:room_updated': {
+              const { call } = msg.payload;
+              setActiveCalls((prev) => {
+                const idx = prev.findIndex((c) => c.callId === call.callId);
+                if (idx >= 0) {
+                  return prev.map((c) => (c.callId === call.callId ? call : c));
+                }
+                return [call, ...prev];
+              });
+              break;
+            }
+            case 'call:ended': {
+              setActiveCalls((prev) =>
+                prev.filter((c) => c.callId !== msg.payload.callId),
+              );
+              onCallEndedRef.current?.(msg.payload);
+              break;
+            }
+            case 'call:signal': {
+              onCallSignalRef.current?.(msg.payload);
               break;
             }
           }
@@ -747,6 +849,57 @@ export function useTelegramSocket({
     [token],
   );
 
+  const startCall = useCallback(
+    (chatId: string, mode: CallMode) => {
+      dispatchWs({ type: 'call:start', payload: { chatId, mode } });
+    },
+    [dispatchWs],
+  );
+
+  const joinCall = useCallback(
+    (callId: string, mode?: CallMode) => {
+      dispatchWs({ type: 'call:join', payload: { callId, mode } });
+    },
+    [dispatchWs],
+  );
+
+  const declineCall = useCallback(
+    (callId: string) => {
+      dispatchWs({ type: 'call:decline', payload: { callId } });
+    },
+    [dispatchWs],
+  );
+
+  const leaveCall = useCallback(
+    (callId: string) => {
+      dispatchWs({ type: 'call:leave', payload: { callId } });
+    },
+    [dispatchWs],
+  );
+
+  const sendCallSignal = useCallback(
+    (callId: string, targetUserId: string, signal: CallSignalPayload) => {
+      dispatchWs({
+        type: 'call:signal',
+        payload: { callId, targetUserId, signal },
+      });
+    },
+    [dispatchWs],
+  );
+
+  const updateCallMediaState = useCallback(
+    (
+      callId: string,
+      state: { micMuted: boolean; videoEnabled: boolean; screenSharing: boolean },
+    ) => {
+      dispatchWs({
+        type: 'call:media_state',
+        payload: { callId, ...state },
+      });
+    },
+    [dispatchWs],
+  );
+
   return {
     connected,
     initialized,
@@ -755,6 +908,7 @@ export function useTelegramSocket({
     chats,
     messagesByChat,
     stickerPacks,
+    activeCalls,
     typingByChat,
     onlineClientCount,
     sendMessage,
@@ -775,5 +929,11 @@ export function useTelegramSocket({
     addStickerToPack,
     removeStickerFromPack,
     deleteStickerPack,
+    startCall,
+    joinCall,
+    declineCall,
+    leaveCall,
+    sendCallSignal,
+    updateCallMediaState,
   };
 }

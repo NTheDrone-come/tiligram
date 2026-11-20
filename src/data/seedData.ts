@@ -14,6 +14,8 @@ export const DEFAULT_APP_SETTINGS: AppSettings = {
     channels: true,
     soundEnabled: true,
     showPreview: true,
+    desktopPopups: true,
+    popupStyle: 'telegram-popup',
   },
   privacy: {
     lastSeen: 'everybody',
@@ -25,6 +27,10 @@ export const DEFAULT_APP_SETTINGS: AppSettings = {
   storage: {
     autoDownloadPhotos: true,
     autoDownloadFiles: true,
+  },
+  updates: {
+    autoCheck: true,
+    githubRepo: '',
   },
 };
 

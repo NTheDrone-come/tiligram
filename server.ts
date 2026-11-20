@@ -15,7 +15,13 @@ import {
   validateUsername,
 } from './src/utils/chatLogic.ts';
 import { MAX_UPLOAD_BYTES } from './src/utils/fileRetention.ts';
+import {
+  isNewerVersion,
+  normalizeGitHubRepoSlug,
+} from './src/utils/callLogic.ts';
 import type {
+  ActiveCallRoom,
+  CallParticipant,
   ChatMessage,
   ChatThread,
   ClientWsEvent,
@@ -37,6 +43,101 @@ interface AuthedSocket {
 }
 
 const activeClients = new Map<WebSocket, AuthedSocket>();
+const activeCalls = new Map<string, ActiveCallRoom>();
+
+function getAppVersion(): string {
+  try {
+    const pkgPath = path.resolve(process.cwd(), 'package.json');
+    const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf-8')) as { version?: string };
+    return pkg.version || '1.0.0';
+  } catch {
+    return '1.0.0';
+  }
+}
+
+function detectGitHubRepoFromEnvOrGit(): string | null {
+  const fromEnv = normalizeGitHubRepoSlug(process.env.GITHUB_REPO || '');
+  if (fromEnv) return fromEnv;
+  try {
+    const gitConfigPath = path.resolve(process.cwd(), '.git/config');
+    if (fs.existsSync(gitConfigPath)) {
+      const text = fs.readFileSync(gitConfigPath, 'utf-8');
+      const match = text.match(/url\s*=\s*(.+)/);
+      if (match && match[1]) {
+        return normalizeGitHubRepoSlug(match[1]);
+      }
+    }
+  } catch {
+    // ignore
+  }
+  return null;
+}
+
+function getActiveCallsForUser(userId: string): ActiveCallRoom[] {
+  const userChatIds = new Set(storage.getChatsForUser(userId).map((c) => c.id));
+  const list: ActiveCallRoom[] = [];
+  for (const call of activeCalls.values()) {
+    if (
+      userChatIds.has(call.chatId) ||
+      call.participants.some((p) => p.userId === userId)
+    ) {
+      list.push(call);
+    }
+  }
+  return list;
+}
+
+function broadcastCallToChat(chat: ChatThread, event: ServerWsEvent): void {
+  const targets = getTargetUserIdsForChat(chat);
+  if (targets) broadcastToUsers(targets, event);
+  else broadcastAll(event);
+}
+
+function removeUserFromCall(callId: string, userId: string, reason?: string): void {
+  const call = activeCalls.get(callId);
+  if (!call) return;
+  const before = call.participants.length;
+  call.participants = call.participants.filter((p) => p.userId !== userId);
+  if (call.participants.length === before) return;
+
+  const chat = storage.getChatById(call.chatId);
+  const shouldEnd =
+    call.participants.length === 0 ||
+    (call.chatType === 'private' && call.participants.length < 2);
+
+  if (shouldEnd) {
+    activeCalls.delete(callId);
+    const endEvt: ServerWsEvent = {
+      type: 'call:ended',
+      payload: {
+        callId: call.callId,
+        chatId: call.chatId,
+        reason: reason || 'Звонок завершён',
+      },
+    };
+    if (chat) broadcastCallToChat(chat, endEvt);
+    else broadcastAll(endEvt);
+  } else {
+    const updEvt: ServerWsEvent = {
+      type: 'call:room_updated',
+      payload: { call },
+    };
+    if (chat) broadcastCallToChat(chat, updEvt);
+    else broadcastAll(updEvt);
+  }
+}
+
+function removeUserFromAllCalls(userId: string): void {
+  // Only leave calls if the user has no other open WebSocket tabs
+  for (const client of activeClients.values()) {
+    if (client.userId === userId) return;
+  }
+  for (const call of Array.from(activeCalls.values())) {
+    if (call.participants.some((p) => p.userId === userId)) {
+      removeUserFromCall(call.callId, userId, 'Собеседник отключился');
+    }
+  }
+}
 
 function sendWs(ws: WebSocket, event: ServerWsEvent): void {
   if (ws.readyState === WebSocket.OPEN) {
@@ -97,10 +198,132 @@ async function startServer() {
     const supabase = await storage.checkSupabaseHealth();
     res.json({
       ok: true,
+      version: getAppVersion(),
       onlineClients: activeClients.size,
+      activeCalls: activeCalls.size,
       storage: supabase.tablesReady ? 'supabase' : 'local',
       supabase,
     });
+  });
+
+  // --- GitHub Auto-Update Check ---
+  app.get('/api/updates/check', async (req, res) => {
+    const currentVersion = getAppVersion();
+    const rawRepo = String(req.query.repo ?? '');
+    const repo =
+      normalizeGitHubRepoSlug(rawRepo) || detectGitHubRepoFromEnvOrGit();
+
+    if (!repo) {
+      res.json({
+        status: 'idle',
+        currentVersion,
+        updateAvailable: false,
+        repo: '',
+        error:
+          'Укажите репозиторий GitHub в формате owner/repo (или добавьте переменную GITHUB_REPO)',
+      });
+      return;
+    }
+
+    const headers: Record<string, string> = {
+      Accept: 'application/vnd.github+json',
+      'User-Agent': 'Tiligram-Updater/1.0',
+    };
+    const ghToken = process.env.GITHUB_TOKEN?.trim();
+    if (ghToken) {
+      headers.Authorization = `Bearer ${ghToken}`;
+    }
+
+    try {
+      const releaseRes = await fetch(
+        `https://api.github.com/repos/${repo}/releases/latest`,
+        { headers },
+      );
+
+      if (releaseRes.ok) {
+        const rel = (await releaseRes.json()) as {
+          tag_name?: string;
+          name?: string;
+          body?: string;
+          html_url?: string;
+          published_at?: string;
+          assets?: Array<{
+            name: string;
+            browser_download_url: string;
+            size: number;
+          }>;
+        };
+        const latestVersion = (rel.tag_name || currentVersion).replace(/^v/i, '');
+        const updateAvailable = isNewerVersion(latestVersion, currentVersion);
+        res.json({
+          status: updateAvailable ? 'available' : 'up-to-date',
+          currentVersion,
+          latestVersion,
+          updateAvailable,
+          releaseName: rel.name || `Тилиграм v${latestVersion}`,
+          releaseNotes: rel.body || '',
+          releaseUrl: rel.html_url || `https://github.com/${repo}/releases`,
+          publishedAt: rel.published_at,
+          repo,
+          downloadAssets: (rel.assets || []).map((a) => ({
+            name: a.name,
+            url: a.browser_download_url,
+            size: a.size,
+          })),
+        });
+        return;
+      }
+
+      if (releaseRes.status === 404) {
+        // Repo may exist without published Releases yet — verify repo existence
+        const repoRes = await fetch(`https://api.github.com/repos/${repo}`, {
+          headers,
+        });
+        if (repoRes.ok) {
+          res.json({
+            status: 'up-to-date',
+            currentVersion,
+            latestVersion: currentVersion,
+            updateAvailable: false,
+            releaseName: `Тилиграм v${currentVersion}`,
+            releaseNotes:
+              'Репозиторий подключён. Создайте первый GitHub Release с тегом v1.0.1 (через git tag v1.0.1 && git push --tags), чтобы Electron автоматически скачивал обновления.',
+            releaseUrl: `https://github.com/${repo}/releases`,
+            repo,
+            downloadAssets: [],
+          });
+          return;
+        }
+        res.json({
+          status: 'error',
+          currentVersion,
+          updateAvailable: false,
+          repo,
+          error:
+            'Репозиторий не найден или приватный (для приватного добавьте GITHUB_TOKEN в Secrets)',
+        });
+        return;
+      }
+
+      res.json({
+        status: 'error',
+        currentVersion,
+        updateAvailable: false,
+        repo,
+        error: `GitHub API вернул статус ${releaseRes.status}`,
+      });
+    } catch (err) {
+      res.json({
+        status: 'error',
+        currentVersion,
+        updateAvailable: false,
+        repo,
+        error:
+          err instanceof Error
+            ? `Ошибка сети GitHub: ${err.message}`
+            : 'Не удалось связаться с GitHub',
+      });
+    }
   });
 
   // --- Auth Endpoints ---
@@ -455,6 +678,7 @@ async function startServer() {
               chats: storage.getChatsForUser(userId),
               messagesByChat: storage.getMessagesForUser(userId),
               stickerPacks: storage.getStickerPacks(),
+              activeCalls: getActiveCallsForUser(userId),
               onlineClientCount: activeClients.size,
             },
           });
@@ -767,6 +991,185 @@ async function startServer() {
             }
             break;
           }
+
+          case 'call:start': {
+            const { chatId, mode } = event.payload;
+            const chat = storage.getChatById(chatId);
+            if (!chat || (chat.type !== 'private' && chat.type !== 'group')) break;
+
+            // Check if a call already exists in this chat
+            let existingCall: ActiveCallRoom | undefined;
+            for (const c of activeCalls.values()) {
+              if (c.chatId === chatId) {
+                existingCall = c;
+                break;
+              }
+            }
+
+            const participant: CallParticipant = {
+              userId: me.id,
+              name: buildFullName(me.firstName, me.lastName),
+              username: `@${me.username}`,
+              avatarUrl: me.avatarUrl,
+              avatarColor: me.avatarColor,
+              micMuted: false,
+              videoEnabled: mode === 'video',
+              screenSharing: false,
+              joinedAt: new Date().toISOString(),
+            };
+
+            if (existingCall) {
+              if (!existingCall.participants.some((p) => p.userId === me.id)) {
+                existingCall.participants.push(participant);
+              }
+              broadcastCallToChat(chat, {
+                type: 'call:room_updated',
+                payload: { call: existingCall },
+              });
+              break;
+            }
+
+            const callId = `call-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+            const newCall: ActiveCallRoom = {
+              callId,
+              chatId: chat.id,
+              chatTitle: chat.title,
+              chatType: chat.type,
+              mode,
+              initiatorId: me.id,
+              initiatorName: participant.name,
+              startedAt: new Date().toISOString(),
+              participants: [participant],
+            };
+            activeCalls.set(callId, newCall);
+
+            // Notify caller with room state immediately
+            sendWs(ws, {
+              type: 'call:room_updated',
+              payload: { call: newCall },
+            });
+
+            // Notify other chat participants of incoming call
+            const targets = getTargetUserIdsForChat(chat);
+            if (targets) {
+              const others = new Set(Array.from(targets).filter((id) => id !== me.id));
+              broadcastToUsers(others, {
+                type: 'call:incoming',
+                payload: { call: newCall },
+              });
+              broadcastToUsers(others, {
+                type: 'call:room_updated',
+                payload: { call: newCall },
+              });
+            } else {
+              broadcastAll(
+                { type: 'call:incoming', payload: { call: newCall } },
+                ws,
+              );
+              broadcastAll(
+                { type: 'call:room_updated', payload: { call: newCall } },
+                ws,
+              );
+            }
+            break;
+          }
+
+          case 'call:join': {
+            const { callId, mode } = event.payload;
+            const call = activeCalls.get(callId);
+            if (!call) break;
+            const chat = storage.getChatById(call.chatId);
+            if (!chat) break;
+
+            const existingIdx = call.participants.findIndex(
+              (p) => p.userId === me.id,
+            );
+            const participant: CallParticipant = {
+              userId: me.id,
+              name: buildFullName(me.firstName, me.lastName),
+              username: `@${me.username}`,
+              avatarUrl: me.avatarUrl,
+              avatarColor: me.avatarColor,
+              micMuted: false,
+              videoEnabled: (mode ?? call.mode) === 'video',
+              screenSharing: false,
+              joinedAt: new Date().toISOString(),
+            };
+
+            if (existingIdx >= 0) {
+              call.participants[existingIdx] = participant;
+            } else {
+              call.participants.push(participant);
+            }
+
+            broadcastCallToChat(chat, {
+              type: 'call:room_updated',
+              payload: { call },
+            });
+            break;
+          }
+
+          case 'call:decline': {
+            const { callId } = event.payload;
+            const call = activeCalls.get(callId);
+            if (!call) break;
+            if (call.chatType === 'private') {
+              activeCalls.delete(callId);
+              const chat = storage.getChatById(call.chatId);
+              const endEvt: ServerWsEvent = {
+                type: 'call:ended',
+                payload: {
+                  callId: call.callId,
+                  chatId: call.chatId,
+                  reason: 'Звонок отклонён',
+                },
+              };
+              if (chat) broadcastCallToChat(chat, endEvt);
+              else broadcastAll(endEvt);
+            }
+            break;
+          }
+
+          case 'call:leave': {
+            removeUserFromCall(event.payload.callId, me.id, 'Звонок завершён');
+            break;
+          }
+
+          case 'call:signal': {
+            const { callId, targetUserId, signal } = event.payload;
+            const call = activeCalls.get(callId);
+            if (!call) break;
+            if (!call.participants.some((p) => p.userId === me.id)) break;
+            broadcastToUsers(new Set([targetUserId]), {
+              type: 'call:signal',
+              payload: {
+                callId,
+                fromUserId: me.id,
+                signal,
+              },
+            });
+            break;
+          }
+
+          case 'call:media_state': {
+            const { callId, micMuted, videoEnabled, screenSharing } = event.payload;
+            const call = activeCalls.get(callId);
+            if (!call) break;
+            const participant = call.participants.find((p) => p.userId === me.id);
+            if (!participant) break;
+            participant.micMuted = Boolean(micMuted);
+            participant.videoEnabled = Boolean(videoEnabled);
+            participant.screenSharing = Boolean(screenSharing);
+
+            const chat = storage.getChatById(call.chatId);
+            const updEvt: ServerWsEvent = {
+              type: 'call:room_updated',
+              payload: { call },
+            };
+            if (chat) broadcastCallToChat(chat, updEvt);
+            else broadcastAll(updEvt);
+            break;
+          }
         }
       } catch (err) {
         console.warn('Invalid WebSocket payload:', err);
@@ -774,7 +1177,11 @@ async function startServer() {
     });
 
     ws.on('close', () => {
+      const closed = activeClients.get(ws);
       activeClients.delete(ws);
+      if (closed) {
+        removeUserFromAllCalls(closed.userId);
+      }
       broadcastAll({
         type: 'presence:count',
         payload: { onlineClientCount: activeClients.size },

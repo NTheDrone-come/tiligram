@@ -8,12 +8,21 @@ export type PrivacyAudience = 'everybody' | 'contacts' | 'nobody';
 
 export type FileRetentionPolicy = 'permanent' | '5_days' | '1_day';
 
+export type NotificationPopupStyle = 'telegram-popup' | 'native';
+
 export interface NotificationSettings {
   privateChats: boolean;
   groups: boolean;
   channels: boolean;
   soundEnabled: boolean;
   showPreview: boolean;
+  desktopPopups: boolean;
+  popupStyle: NotificationPopupStyle;
+}
+
+export interface UpdateSettings {
+  autoCheck: boolean;
+  githubRepo: string;
 }
 
 export interface PrivacySettings {
@@ -40,6 +49,99 @@ export interface AppSettings {
   notifications: NotificationSettings;
   privacy: PrivacySettings;
   storage: StorageSettings;
+  updates?: UpdateSettings;
+}
+
+export type CallMode = 'audio' | 'video';
+
+export interface CallParticipant {
+  userId: string;
+  name: string;
+  username: string;
+  avatarUrl?: string;
+  avatarColor: string;
+  micMuted: boolean;
+  videoEnabled: boolean;
+  screenSharing: boolean;
+  joinedAt: string;
+}
+
+export interface ActiveCallRoom {
+  callId: string;
+  chatId: string;
+  chatTitle: string;
+  chatType: 'private' | 'group';
+  mode: CallMode;
+  initiatorId: string;
+  initiatorName: string;
+  startedAt: string;
+  participants: CallParticipant[];
+}
+
+export type CallSignalPayload =
+  | { type: 'offer'; sdp: string }
+  | { type: 'answer'; sdp: string }
+  | {
+      type: 'ice';
+      candidate: {
+        candidate: string;
+        sdpMid?: string | null;
+        sdpMLineIndex?: number | null;
+      };
+    };
+
+export interface AppUpdateInfo {
+  status:
+    | 'idle'
+    | 'checking'
+    | 'available'
+    | 'up-to-date'
+    | 'downloading'
+    | 'downloaded'
+    | 'error';
+  currentVersion: string;
+  latestVersion?: string;
+  updateAvailable?: boolean;
+  releaseName?: string;
+  releaseNotes?: string;
+  releaseUrl?: string;
+  publishedAt?: string;
+  repo?: string;
+  percent?: number;
+  error?: string;
+  downloadAssets?: Array<{ name: string; url: string; size: number }>;
+}
+
+export interface TiligramDesktopBridge {
+  isElectron: boolean;
+  platform: string;
+  getVersion: () => Promise<string>;
+  checkForUpdates: (repo?: string) => Promise<{
+    supported: boolean;
+    currentVersion: string;
+    latestVersion?: string;
+    error?: string;
+  }>;
+  downloadUpdate: () => Promise<{ ok: boolean }>;
+  installUpdate: () => Promise<{ ok: boolean }>;
+  onUpdateStatus: (cb: (status: AppUpdateInfo) => void) => () => void;
+  showNotification: (payload: {
+    chatId: string;
+    title: string;
+    subtitle?: string;
+    body: string;
+    avatarColor?: string;
+    silent?: boolean;
+    style?: NotificationPopupStyle;
+  }) => Promise<{ ok: boolean; mode?: string }>;
+  onNotificationClick: (cb: (payload: { chatId: string }) => void) => () => void;
+  setBadgeCount: (count: number) => Promise<{ ok: boolean }>;
+}
+
+declare global {
+  interface Window {
+    tiligramDesktop?: TiligramDesktopBridge;
+  }
 }
 
 export interface UserProfile {
@@ -179,6 +281,7 @@ export interface ServerStateSnapshot {
   chats: ChatThread[];
   messagesByChat: Record<string, ChatMessage[]>;
   stickerPacks: StickerPack[];
+  activeCalls?: ActiveCallRoom[];
   onlineClientCount: number;
 }
 
@@ -274,6 +377,39 @@ export type ClientWsEvent =
   | {
       type: 'settings:update';
       payload: AppSettings;
+    }
+  | {
+      type: 'call:start';
+      payload: { chatId: string; mode: CallMode };
+    }
+  | {
+      type: 'call:join';
+      payload: { callId: string; mode?: CallMode };
+    }
+  | {
+      type: 'call:decline';
+      payload: { callId: string };
+    }
+  | {
+      type: 'call:leave';
+      payload: { callId: string };
+    }
+  | {
+      type: 'call:signal';
+      payload: {
+        callId: string;
+        targetUserId: string;
+        signal: CallSignalPayload;
+      };
+    }
+  | {
+      type: 'call:media_state';
+      payload: {
+        callId: string;
+        micMuted: boolean;
+        videoEnabled: boolean;
+        screenSharing: boolean;
+      };
     };
 
 export type ServerWsEvent =
@@ -295,4 +431,18 @@ export type ServerWsEvent =
   | { type: 'profile:updated'; payload: { user: UserProfile } }
   | { type: 'settings:updated'; payload: { settings: AppSettings } }
   | { type: 'stickers:updated'; payload: { stickerPacks: StickerPack[] } }
-  | { type: 'presence:count'; payload: { onlineClientCount: number } };
+  | { type: 'presence:count'; payload: { onlineClientCount: number } }
+  | { type: 'call:incoming'; payload: { call: ActiveCallRoom } }
+  | { type: 'call:room_updated'; payload: { call: ActiveCallRoom } }
+  | {
+      type: 'call:ended';
+      payload: { callId: string; chatId: string; reason?: string };
+    }
+  | {
+      type: 'call:signal';
+      payload: {
+        callId: string;
+        fromUserId: string;
+        signal: CallSignalPayload;
+      };
+    };

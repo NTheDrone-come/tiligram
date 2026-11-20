@@ -3,10 +3,14 @@ import {
   Bell,
   Camera,
   CheckCircle2,
+  Download,
+  ExternalLink,
   HardDrive,
+  Loader2,
   Lock,
   LogOut,
   Palette,
+  RefreshCw,
   Sparkles,
   Trash2,
   User,
@@ -26,10 +30,12 @@ import {
 } from '../utils/chatLogic';
 import type {
   AppSettings,
+  NotificationPopupStyle,
   PrivacyAudience,
   StickerPack,
   UserProfile,
 } from '../types/telegram';
+import type { AppUpdaterController } from '../hooks/useAppUpdater';
 
 export type SettingsTabId =
   | 'profile'
@@ -46,6 +52,7 @@ interface SettingsModalProps {
   currentUser: UserProfile;
   settings: AppSettings;
   stickerPacks: StickerPack[];
+  updater: AppUpdaterController;
   onClose: () => void;
   onSaveProfile: (params: {
     firstName: string;
@@ -62,6 +69,7 @@ interface SettingsModalProps {
   }) => void;
   onChangeSettings: (next: AppSettings) => void;
   onOpenStickerStudio: () => void;
+  onTestNotification: () => void;
   onLogout: () => void;
 }
 
@@ -161,13 +169,20 @@ export function SettingsModal({
   currentUser,
   settings,
   stickerPacks,
+  updater,
   onClose,
   onSaveProfile,
   onChangeSettings,
   onOpenStickerStudio,
+  onTestNotification,
   onLogout,
 }: SettingsModalProps) {
   const [tab, setTab] = useState<SettingsTabId>(initialTab);
+  const [browserNotifPerm, setBrowserNotifPerm] = useState<string>(() =>
+    typeof window !== 'undefined' && 'Notification' in window
+      ? Notification.permission
+      : 'unsupported',
+  );
 
   // Profile fields
   const [firstName, setFirstName] = useState(currentUser.firstName);
@@ -215,6 +230,9 @@ export function SettingsModal({
       setPassMessage(null);
       setCurPassword('');
       setNewPassword('');
+      if (typeof window !== 'undefined' && 'Notification' in window) {
+        setBrowserNotifPerm(Notification.permission);
+      }
     }
     wasOpenRef.current = open;
   }, [open, initialTab, currentUser]);
@@ -861,7 +879,82 @@ export function SettingsModal({
 
             {/* TAB 3: NOTIFICATIONS */}
             {tab === 'notifications' && (
-              <div className="space-y-2 max-w-xl">
+              <div className="space-y-3 max-w-xl">
+                <div className="p-4 rounded-2xl bg-slate-50 dark:bg-[#0E1621] border border-slate-200/80 dark:border-[#243242] space-y-3">
+                  <div className="flex items-start justify-between gap-3">
+                    <div>
+                      <div className="text-sm font-semibold text-slate-900 dark:text-slate-100">
+                        Всплывающие уведомления (как в Telegram)
+                      </div>
+                      <div className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
+                        {updater.isElectron
+                          ? 'Работают на уровне Windows / macOS / Linux поверх всех окон'
+                          : 'Всплывающие окна в углу экрана + системные уведомления браузера (и в Electron-сборке)'}
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={onTestNotification}
+                      className="px-3.5 py-2 rounded-xl bg-[var(--tg-accent)] text-white text-xs font-semibold hover:opacity-95 whitespace-nowrap shrink-0 cursor-pointer"
+                    >
+                      Проверить окно
+                    </button>
+                  </div>
+
+                  <ToggleRow
+                    label="Показывать всплывающие окна"
+                    description="Отображать карточку сообщения в правом нижнем углу с быстрым ответом"
+                    checked={settings.notifications.desktopPopups !== false}
+                    onChange={(desktopPopups) =>
+                      onChangeSettings({
+                        ...settings,
+                        notifications: { ...settings.notifications, desktopPopups },
+                      })
+                    }
+                  />
+
+                  <AudienceSelect
+                    label="Стиль десктопных уведомлений"
+                    value={settings.notifications.popupStyle || 'telegram-popup'}
+                    options={[
+                      { id: 'telegram-popup', label: 'Окно Тилиграм' },
+                      { id: 'native', label: 'Системные ОС' },
+                    ]}
+                    onChange={(popupStyle: NotificationPopupStyle) =>
+                      onChangeSettings({
+                        ...settings,
+                        notifications: { ...settings.notifications, popupStyle },
+                      })
+                    }
+                  />
+
+                  {!updater.isElectron && browserNotifPerm !== 'granted' && browserNotifPerm !== 'unsupported' && (
+                    <div className="flex items-center justify-between gap-3 px-3 py-2 rounded-xl bg-white dark:bg-[#17212B] border border-slate-200/80 dark:border-[#243242]">
+                      <span className="text-xs text-slate-600 dark:text-slate-300">
+                        {browserNotifPerm === 'denied'
+                          ? 'Системные уведомления заблокированы в браузере'
+                          : 'Разрешить системные уведомления рабочего стола'}
+                      </span>
+                      {browserNotifPerm !== 'denied' && (
+                        <button
+                          type="button"
+                          onClick={async () => {
+                            try {
+                              const perm = await Notification.requestPermission();
+                              setBrowserNotifPerm(perm);
+                            } catch {
+                              // ignore
+                            }
+                          }}
+                          className="px-3 py-1.5 rounded-lg bg-[var(--tg-accent)]/15 text-[var(--tg-accent)] text-xs font-semibold hover:bg-[var(--tg-accent)]/25 cursor-pointer whitespace-nowrap shrink-0"
+                        >
+                          Разрешить
+                        </button>
+                      )}
+                    </div>
+                  )}
+                </div>
+
                 <ToggleRow
                   label="Личные чаты"
                   description="Уведомления о новых личных сообщениях"
@@ -897,8 +990,8 @@ export function SettingsModal({
                 />
                 <div className="my-2 border-t border-slate-200/70 dark:border-[#243242]" />
                 <ToggleRow
-                  label="Звуки сообщений"
-                  description="Воспроизводить мягкий звук при входящих сообщениях"
+                  label="Звуки сообщений и звонков"
+                  description="Воспроизводить мягкий звук при входящих сообщениях и рингтон при звонках"
                   checked={settings.notifications.soundEnabled}
                   onChange={(soundEnabled) =>
                     onChangeSettings({
@@ -1114,6 +1207,117 @@ export function SettingsModal({
                       })
                     }
                   />
+                </div>
+
+                {/* App Auto-Update Toggle & Manual Check */}
+                <div className="p-4 rounded-2xl bg-slate-50 dark:bg-[#0E1621] border border-slate-200/80 dark:border-[#243242] space-y-3">
+                  <div className="flex items-center justify-between gap-3">
+                    <div>
+                      <div className="text-sm font-semibold text-slate-900 dark:text-slate-100">
+                        Автообновление приложения
+                      </div>
+                      <div className="text-xs text-slate-500 dark:text-slate-400 mt-0.5 tabular-nums">
+                        Версия v{updater.updateInfo.currentVersion} ·{' '}
+                        {updater.isElectron ? 'Electron Desktop' : 'Web'}
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      disabled={updater.updateInfo.status === 'checking'}
+                      onClick={() => void updater.checkForUpdates()}
+                      className="px-3.5 py-2 rounded-xl bg-[var(--tg-accent)] text-white text-xs font-semibold hover:opacity-95 disabled:opacity-60 flex items-center gap-1.5 whitespace-nowrap shrink-0 cursor-pointer"
+                    >
+                      {updater.updateInfo.status === 'checking' ? (
+                        <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                      ) : (
+                        <RefreshCw className="w-3.5 h-3.5" />
+                      )}
+                      <span>Проверить</span>
+                    </button>
+                  </div>
+
+                  <ToggleRow
+                    label="Автоматически проверять обновления"
+                    description="Загружать новые релизы Тилиграм из привязанного репозитория GitHub"
+                    checked={settings.updates?.autoCheck ?? true}
+                    onChange={(autoCheck) =>
+                      onChangeSettings({
+                        ...settings,
+                        updates: {
+                          autoCheck,
+                          githubRepo: settings.updates?.githubRepo ?? '',
+                        },
+                      })
+                    }
+                  />
+
+                  {updater.updateInfo.status === 'up-to-date' && (
+                    <div className="flex items-center gap-2 px-3 py-2 rounded-xl bg-emerald-500/10 text-xs font-medium text-emerald-500">
+                      <CheckCircle2 className="w-4 h-4 shrink-0" />
+                      <span>Установлена актуальная версия v{updater.updateInfo.currentVersion}</span>
+                    </div>
+                  )}
+
+                  {updater.updateInfo.status === 'available' && (
+                    <div className="flex items-center justify-between gap-3 px-3 py-2.5 rounded-xl bg-white dark:bg-[#17212B] border border-slate-200/80 dark:border-[#243242]">
+                      <div className="text-xs font-semibold text-slate-900 dark:text-slate-100">
+                        Доступна версия v{updater.updateInfo.latestVersion}
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => void updater.downloadUpdate()}
+                        className="px-3 py-1.5 rounded-lg bg-emerald-500 hover:bg-emerald-600 text-white text-xs font-semibold flex items-center gap-1.5 cursor-pointer shrink-0"
+                      >
+                        {updater.isElectron ? (
+                          <>
+                            <Download className="w-3.5 h-3.5" />
+                            <span>Скачать</span>
+                          </>
+                        ) : (
+                          <>
+                            <ExternalLink className="w-3.5 h-3.5" />
+                            <span>Открыть релиз</span>
+                          </>
+                        )}
+                      </button>
+                    </div>
+                  )}
+
+                  {updater.updateInfo.status === 'downloading' && (
+                    <div className="space-y-1.5 px-1">
+                      <div className="flex items-center justify-between text-xs font-medium text-slate-600 dark:text-slate-300 tabular-nums">
+                        <span>Скачивание обновления...</span>
+                        <span>{updater.updateInfo.percent ?? 0}%</span>
+                      </div>
+                      <div className="h-1.5 rounded-full bg-slate-200 dark:bg-[#17212B] overflow-hidden">
+                        <div
+                          className="h-full bg-[var(--tg-accent)] transition-all"
+                          style={{ width: `${updater.updateInfo.percent ?? 0}%` }}
+                        />
+                      </div>
+                    </div>
+                  )}
+
+                  {updater.updateInfo.status === 'downloaded' && (
+                    <div className="flex items-center justify-between gap-3 px-3 py-2.5 rounded-xl bg-emerald-500/10 border border-emerald-500/25">
+                      <span className="text-xs font-semibold text-emerald-400">
+                        Обновление v{updater.updateInfo.latestVersion} готово
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => void updater.installUpdate()}
+                        className="px-3 py-1.5 rounded-lg bg-emerald-500 hover:bg-emerald-600 text-white text-xs font-semibold cursor-pointer shrink-0"
+                      >
+                        Перезапустить
+                      </button>
+                    </div>
+                  )}
+
+                  {updater.updateInfo.status === 'error' && (
+                    <div className="px-3 py-2 rounded-xl bg-rose-500/10 text-xs text-rose-400">
+                      {updater.updateInfo.error || 'Не удалось проверить обновления'}
+                    </div>
+                  )}
                 </div>
               </div>
             )}

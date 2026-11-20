@@ -21,6 +21,8 @@ interface NavigationDrawerProps {
   currentUser: UserProfile;
   settings: AppSettings;
   archivedCount: number;
+  appVersion: string;
+  isElectron: boolean;
   onClose: () => void;
   onToggleTheme: () => void;
   onOpenSaved: () => void;
@@ -36,6 +38,8 @@ export function NavigationDrawer({
   currentUser,
   settings,
   archivedCount,
+  appVersion,
+  isElectron,
   onClose,
   onToggleTheme,
   onOpenSaved,
@@ -263,8 +267,8 @@ export function NavigationDrawer({
           </button>
         </div>
 
-        <div className="px-5 py-3 border-t border-slate-100 dark:border-[#0E1621] text-xs text-slate-400 dark:text-slate-500">
-          Тилиграм Web
+        <div className="px-5 py-3 border-t border-slate-100 dark:border-[#0E1621] text-xs text-slate-400 dark:text-slate-500 tabular-nums">
+          {isElectron ? 'Тилиграм Desktop' : 'Тилиграм Web'} · v{appVersion}
         </div>
       </nav>
     </div>

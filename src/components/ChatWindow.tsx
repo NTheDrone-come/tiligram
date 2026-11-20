@@ -16,6 +16,7 @@ import {
   Mic,
   MoreVertical,
   Paperclip,
+  Phone,
   Pin,
   Plus,
   Reply,
@@ -24,6 +25,8 @@ import {
   Smile,
   Square,
   Trash2,
+  Users,
+  Video,
   X,
 } from 'lucide-react';
 import { Avatar } from './Avatar';
@@ -36,7 +39,9 @@ import {
 } from '../utils/chatLogic';
 import { formatRemainingRetention } from '../utils/fileRetention';
 import type {
+  ActiveCallRoom,
   AppSettings,
+  CallMode,
   ChatMessage,
   ChatThread,
   CustomSticker,
@@ -53,6 +58,8 @@ interface ChatWindowProps {
   typingState?: TypingState;
   settings: AppSettings;
   stickerPacks: StickerPack[];
+  activeCallInChat?: ActiveCallRoom | null;
+  isJoinedToChatCall?: boolean;
   highlightMessageId: string | null;
   showInfoPanel: boolean;
   onBackMobile: () => void;
@@ -81,6 +88,9 @@ interface ChatWindowProps {
   onTyping: (chatId: string, isTyping: boolean) => void;
   onOpenLightbox: (url: string, caption?: string) => void;
   onClearHighlight: () => void;
+  onStartCall: (chatId: string, mode: CallMode) => void;
+  onJoinCall: (call: ActiveCallRoom) => void;
+  onOpenActiveCall: () => void;
 }
 
 export function ChatWindow({
@@ -90,6 +100,8 @@ export function ChatWindow({
   typingState,
   settings,
   stickerPacks,
+  activeCallInChat,
+  isJoinedToChatCall,
   highlightMessageId,
   showInfoPanel,
   onBackMobile,
@@ -107,6 +119,9 @@ export function ChatWindow({
   onTyping,
   onOpenLightbox,
   onClearHighlight,
+  onStartCall,
+  onJoinCall,
+  onOpenActiveCall,
 }: ChatWindowProps) {
   const [draft, setDraft] = useState('');
   const [replyingTo, setReplyingTo] = useState<ChatMessage | null>(null);
@@ -458,6 +473,44 @@ export function ChatWindow({
 
         {/* Header Actions */}
         <div className="flex items-center gap-1 shrink-0">
+          {(chat.type === 'private' || chat.type === 'group') && (
+            <>
+              <button
+                type="button"
+                onClick={() => onStartCall(chat.id, 'audio')}
+                aria-label={
+                  chat.type === 'group'
+                    ? 'Начать групповой аудиозвонок'
+                    : 'Позвонить (P2P аудио)'
+                }
+                title={
+                  chat.type === 'group' ? 'Групповой звонок' : 'Аудиозвонок P2P'
+                }
+                className="min-w-[40px] min-h-[40px] rounded-full flex items-center justify-center text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-[#232E3C] hover:text-emerald-500 transition-colors cursor-pointer"
+              >
+                <Phone className="w-[19px] h-[19px]" />
+              </button>
+
+              <button
+                type="button"
+                onClick={() => onStartCall(chat.id, 'video')}
+                aria-label={
+                  chat.type === 'group'
+                    ? 'Начать групповой видеозвонок'
+                    : 'Видеозвонок (P2P)'
+                }
+                title={
+                  chat.type === 'group'
+                    ? 'Групповой видеозвонок'
+                    : 'Видеозвонок P2P'
+                }
+                className="min-w-[40px] min-h-[40px] rounded-full flex items-center justify-center text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-[#232E3C] hover:text-[#3390EC] transition-colors cursor-pointer"
+              >
+                <Video className="w-[19px] h-[19px]" />
+              </button>
+            </>
+          )}
+
           <button
             type="button"
             onClick={() => {
@@ -572,6 +625,44 @@ export function ChatWindow({
           </div>
         </div>
       </header>
+
+      {/* Active P2P / Group Call Banner */}
+      {activeCallInChat && (
+        <div className="px-4 py-2.5 bg-emerald-600/12 dark:bg-emerald-500/12 border-b border-emerald-500/25 flex items-center justify-between gap-3 shrink-0 z-10">
+          <div className="flex items-center gap-2.5 min-w-0">
+            <div className="w-8 h-8 rounded-full bg-emerald-500 text-white flex items-center justify-center shrink-0">
+              {activeCallInChat.chatType === 'group' ? (
+                <Users className="w-4 h-4" />
+              ) : (
+                <Phone className="w-4 h-4" />
+              )}
+            </div>
+            <div className="min-w-0">
+              <div className="text-[13px] font-semibold text-emerald-700 dark:text-emerald-300 truncate">
+                {activeCallInChat.chatType === 'group'
+                  ? 'Активный групповой звонок'
+                  : 'Активный P2P-звонок'}
+              </div>
+              <div className="text-[12px] text-slate-600 dark:text-slate-300 truncate tabular-nums">
+                Участников: {activeCallInChat.participants.length} ·{' '}
+                {activeCallInChat.participants.map((p) => p.name).join(', ')}
+              </div>
+            </div>
+          </div>
+
+          <button
+            type="button"
+            onClick={() =>
+              isJoinedToChatCall
+                ? onOpenActiveCall()
+                : onJoinCall(activeCallInChat)
+            }
+            className="px-3.5 py-1.5 rounded-xl bg-emerald-500 hover:bg-emerald-600 text-white text-xs font-semibold whitespace-nowrap shrink-0 cursor-pointer"
+          >
+            {isJoinedToChatCall ? 'Вернуться в звонок' : 'Присоединиться'}
+          </button>
+        </div>
+      )}
 
       {/* In-Chat Search Bar */}
       {chatSearchOpen && (
